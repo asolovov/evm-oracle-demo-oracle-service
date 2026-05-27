@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -7,42 +5,130 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_PASSWORD: dev
-      POSTGRES_USER: dev
-      POSTGRES_DB: microservice_dev
+      POSTGRES_USER: oracle_user
+      POSTGRES_PASSWORD: oracle_pass
+      POSTGRES_DB: evm_oracle
     volumes:
       - ./data/db/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oracle_user -d evm_oracle"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   migrate:
     image: migrate/migrate
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     volumes:
       - ./db/migrations:/migrations
-    command: ["-path=/migrations", "-database", "postgres://dev:dev@postgres:5432/microservice_dev?sslmode=disable", "up"]
+    command:
+      - -path=/migrations
+      - -database
+      - postgres://oracle_user:oracle_pass@postgres:5432/evm_oracle?sslmode=disable
+      - up
 
-  app:
+  oracle:
     build: .
     restart: unless-stopped
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
-      - "8080:8080"   # HTTP REST API
-      - "9090:9090"   # gRPC
+      - "9090:9090"   # gRPC (OracleService: SetHeartbeat / GetSubmissionStatus / ListSubmissions)
+      - "8080:8080"   # /healthz, /readyz, /metrics
+    volumes:
+      # Reporter keys live OUTSIDE the image. Mount the host directory
+      # holding reporter{1,2,3}.json (the format produced by the contracts
+      # repo's generateReporters.ts) into the container with 0400 perms.
+      #
+      # For local dev: point this at ../evm-oracle-demo-contracts/.reporters.
+      # On the live VPS this will be /etc/lighthouse/secrets/ (rule 5).
+      - ./local/reporters:/etc/lighthouse/secrets:ro
     environment:
-      # Database configuration
-      DATABASE_ENABLED: "true"
+      # ---------------------------------------------------------------------
+      # Database
+      # ---------------------------------------------------------------------
       DATABASE_HOST: postgres
       DATABASE_PORT: 5432
-      DATABASE_USER: dev
-      DATABASE_PASSWORD: dev
-      DATABASE_NAME: microservice_dev
-      # HTTP REST API configuration
-      HTTP_ENABLED: "true"
-      HTTP_HOST: "0.0.0.0"
-      HTTP_PORT: 8080
-      HTTP_MOCK_AUTH: "true"  # Bypass JWT validation for local dev
-      # gRPC configuration
-      GRPC_ENABLED: "true"
+      DATABASE_USER: oracle_user
+      DATABASE_PASSWORD: oracle_pass
+      DATABASE_NAME: evm_oracle
+      DATABASE_SSL_MODE: disable
+
+      # ---------------------------------------------------------------------
+      # gRPC server (admin + read only — no TriggerUpdate)
+      # ---------------------------------------------------------------------
       GRPC_HOST: "0.0.0.0"
       GRPC_PORT: 9090
+      GRPC_REFLECTION_ENABLED: "true"
+
+      # ---------------------------------------------------------------------
+      # Healthz / metrics
+      # ---------------------------------------------------------------------
+      HEALTHZ_HOST: "0.0.0.0"
+      HEALTHZ_PORT: 8080
+
+      # ---------------------------------------------------------------------
+      # Chain (Ethereum Sepolia, chainId 11155111). Set CHAIN_RPC_URL to a
+      # real endpoint (Alchemy / Infura / public node) for the compose stack
+      # to reach mainnet-like behaviour.
+      # ---------------------------------------------------------------------
+      CHAIN_NAME: sepolia
+      CHAIN_CHAIN_ID: 11155111
+      CHAIN_RPC_URL: ${CHAIN_RPC_URL}
+      CHAIN_REGISTRY_ADDRESS: "0x89a6c12a403733c6a817472cec46a530581cb7ef"
+      # JSON map of asset symbol -> aggregator address. CHAIN_AGGREGATOR_ADDRESSES
+      # must be set as a JSON string (viper parses it). Real values live in .env.
+      CHAIN_AGGREGATOR_ADDRESSES: ${CHAIN_AGGREGATOR_ADDRESSES}
+
+      # ---------------------------------------------------------------------
+      # Upstream services (gRPC)
+      # ---------------------------------------------------------------------
+      PRICE_ADDRESS: price-service:9090
+      PRICE_TIMEOUT_SEC: 5
+      INDEXER_ADDRESS: indexer-service:9090
+      INDEXER_TIMEOUT_SEC: 30
+
+      # ---------------------------------------------------------------------
+      # Stream consumer
+      # ---------------------------------------------------------------------
+      STREAM_BACKFILL_FROM_BLOCK: 0
+      STREAM_RECONNECT_BACKOFF_SEC: 1
+      STREAM_RECONNECT_MAX_BACKOFF_SEC: 30
+
+      # ---------------------------------------------------------------------
+      # Reporter signing — paths inside the container after the volume mount.
+      # ---------------------------------------------------------------------
+      SIGNER_REPORTER_KEY_PATHS: '["/etc/lighthouse/secrets/reporter1.json","/etc/lighthouse/secrets/reporter2.json","/etc/lighthouse/secrets/reporter3.json"]'
+      SIGNER_THRESHOLD: 2
+      SIGNER_ALLOW_INSECURE_PERMS: "false"
+
+      # ---------------------------------------------------------------------
+      # Submission
+      # ---------------------------------------------------------------------
+      SUBMISSION_MAX_RETRIES: 3
+      SUBMISSION_REPLACE_AFTER_SEC: 60
+      SUBMISSION_GAS_MULTIPLIER: 1.1
+      SUBMISSION_CONFIRM_TIMEOUT_SEC: 300
+
+      # ---------------------------------------------------------------------
+      # Heartbeat (internal scheduler; no inter-service RPC)
+      # ---------------------------------------------------------------------
+      HEARTBEAT_ENABLED: "true"
+      HEARTBEAT_INTERVAL_SEC: 3600
+      HEARTBEAT_DEVIATION_THRESHOLD: 0.015
+
+      # ---------------------------------------------------------------------
+      # Conversion (Chainlink 8-decimal scale)
+      # ---------------------------------------------------------------------
+      CONVERSION_ON_CHAIN_DECIMALS: 8
+
+      # ---------------------------------------------------------------------
+      # Telemetry
+      # ---------------------------------------------------------------------
+      TELEMETRY_LOG_LEVEL: info
+      TELEMETRY_LOG_FORMAT: json
