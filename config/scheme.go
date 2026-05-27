@@ -1,124 +1,112 @@
-// Package config defines application configuration defaults and schema.
+// Package config defines the oracle-service configuration schema, defaults, and validation.
+//
+// All configuration lives here per architecture rule 6. Every nested key is
+// registered with viper.SetDefault in init.go (rule 6 — viper services); a
+// separate Validate pass fails fast on missing required keys post-Unmarshal.
 package config
 
-// GRPCConfig holds gRPC server settings.
-type GRPCConfig struct {
-	Host             string `mapstructure:"host"`
-	Timeout          string `mapstructure:"timeout"`
-	MaxSendMsgSize   int    `mapstructure:"max_send_msg_size"`
-	MaxRecvMsgSize   int    `mapstructure:"max_recv_msg_size"`
-	Port             int    `mapstructure:"port"`
-	NumStreamWorkers uint32 `mapstructure:"num_stream_workers"`
-	Enabled          bool   `mapstructure:"enabled"`
-}
-
-// GRPCClientConfig holds gRPC client settings for connecting to external services.
-type GRPCClientConfig struct {
-	KeepAlive *KeepAliveConfig `mapstructure:"keep_alive"` // Keep-alive settings
-	Address   string           `mapstructure:"address"`    // External service address (e.g., "user-service:9090")
-	Timeout   string           `mapstructure:"timeout"`    // Request timeout (e.g., "30s")
-	Enabled   bool             `mapstructure:"enabled"`    // Enable gRPC client module
-}
-
-// KeepAliveConfig holds gRPC keep-alive settings.
-type KeepAliveConfig struct {
-	Time                string `mapstructure:"time"`                  // Send pings interval (e.g., "10s")
-	Timeout             string `mapstructure:"timeout"`               // Ping ack timeout (e.g., "1s")
-	PermitWithoutStream bool   `mapstructure:"permit_without_stream"` // Send pings even without active streams
-}
-
-// HTTPConfig holds HTTP server settings.
-type HTTPConfig struct {
-	// Pointers first to reduce padding.
-	CORS       *CORSConfig       `mapstructure:"cors"`       // CORS settings
-	RateLimit  *RateLimitConfig  `mapstructure:"rate_limit"` // Rate limiting
-	Gatekeeper *GatekeeperConfig `mapstructure:"gatekeeper"` // Gatekeeper configuration (JWT validation service)
-
-	Host        string   `mapstructure:"host"`         // Server host (e.g., "0.0.0.0" or "localhost")
-	Timeout     string   `mapstructure:"timeout"`      // Request timeout (e.g., "30s")
-	SwaggerSpec string   `mapstructure:"swagger_spec"` // Path to swagger.yaml
-	AdminEmails []string `mapstructure:"admin_emails"` // Admin user emails for role checking
-	Port        int      `mapstructure:"port"`         // Server port (e.g., 8080)
-
-	Enabled  bool `mapstructure:"enabled"`   // Enable HTTP module
-	MockAuth bool `mapstructure:"mock_auth"` // Enable mock auth for testing (bypasses gatekeeper)
-}
-
-// CORSConfig holds CORS settings.
-type CORSConfig struct {
-	AllowedOrigins []string `mapstructure:"allowed_origins"` // ["*"] or ["https://myapp.com"]
-	AllowedMethods []string `mapstructure:"allowed_methods"` // ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
-	AllowedHeaders []string `mapstructure:"allowed_headers"` // ["*"] or specific headers
-	MaxAge         int      `mapstructure:"max_age"`         // Preflight cache duration in seconds
-	Enabled        bool     `mapstructure:"enabled"`         // Enable CORS middleware
-}
-
-// RateLimitConfig holds rate limiting settings.
-type RateLimitConfig struct {
-	Enabled        bool    `mapstructure:"enabled"`          // Enable rate limiting middleware
-	RequestsPerSec float64 `mapstructure:"requests_per_sec"` // Requests per second (e.g., 100.0)
-	Burst          int     `mapstructure:"burst"`            // Burst size (e.g., 20)
-}
-
-// GatekeeperConfig holds gatekeeper service settings.
-type GatekeeperConfig struct {
-	Address string `mapstructure:"address"` // gRPC address (e.g., "localhost:9091")
-	Timeout string `mapstructure:"timeout"` // Request timeout (e.g., "5s")
-}
-
-// WebSocketConfig holds WebSocket server settings.
-type WebSocketConfig struct {
-	Limits          *WSLimitsConfig `mapstructure:"limits"`            // Connection limits
-	Host            string          `mapstructure:"host"`              // Server host (e.g., "0.0.0.0")
-	Timeout         string          `mapstructure:"timeout"`           // Connection timeout (e.g., "30s")
-	PingInterval    string          `mapstructure:"ping_interval"`     // Ping keepalive interval (e.g., "54s")
-	PongWait        string          `mapstructure:"pong_wait"`         // Pong response timeout (e.g., "60s")
-	WriteWait       string          `mapstructure:"write_wait"`        // Write deadline (e.g., "10s")
-	MaxMessageSize  int64           `mapstructure:"max_message_size"`  // Max message size in bytes
-	Port            int             `mapstructure:"port"`              // Server port (e.g., 8081)
-	ReadBufferSize  int             `mapstructure:"read_buffer_size"`  // Read buffer size in bytes
-	WriteBufferSize int             `mapstructure:"write_buffer_size"` // Write buffer size in bytes
-	Enabled         bool            `mapstructure:"enabled"`           // Enable WebSocket module
-}
-
-// WSLimitsConfig holds WebSocket connection limit settings.
-type WSLimitsConfig struct {
-	MaxConnections        int `mapstructure:"max_connections"`          // Global max connections (0 = unlimited)
-	MaxConnectionsPerRoom int `mapstructure:"max_connections_per_room"` // Per-room max connections (0 = unlimited)
-}
-
-// Scheme represents the application configuration scheme.
+// Scheme is the top-level configuration aggregate.
 type Scheme struct {
-	// Database configuration for repository module (optional; nil if disabled).
-	Database *DatabaseConfig `mapstructure:"database"`
-
-	// GRPC configuration for gRPC module (optional; nil if disabled).
-	GRPC *GRPCConfig `mapstructure:"grpc"`
-
-	// GRPCClient configuration for gRPC client module (optional; nil if disabled).
-	GRPCClient *GRPCClientConfig `mapstructure:"grpc_client"`
-
-	// HTTP configuration for HTTP module (optional; nil if disabled).
-	HTTP *HTTPConfig `mapstructure:"http"`
-
-	// WebSocket configuration for WebSocket module (optional; nil if disabled).
-	WebSocket *WebSocketConfig `mapstructure:"websocket"`
-
-	// Env is the application environment (e.g. prod, dev, local).
-	Env string `mapstructure:"env"`
+	Database   DatabaseConfig   `mapstructure:"database"`
+	GRPC       GRPCConfig       `mapstructure:"grpc"`
+	Healthz    HealthzConfig    `mapstructure:"healthz"`
+	Chain      ChainConfig      `mapstructure:"chain"`
+	Price      PriceClientConfig `mapstructure:"price"`
+	Indexer    IndexerClientConfig `mapstructure:"indexer"`
+	Stream     StreamConfig     `mapstructure:"stream"`
+	Signer     SignerConfig     `mapstructure:"signer"`
+	Submission SubmissionConfig `mapstructure:"submission"`
+	Heartbeat  HeartbeatConfig  `mapstructure:"heartbeat"`
+	Conversion ConversionConfig `mapstructure:"conversion"`
+	Telemetry  TelemetryConfig  `mapstructure:"telemetry"`
 }
 
-// DatabaseConfig holds database connection settings.
+// DatabaseConfig holds Postgres connection settings (rule 7 — dedicated DB).
 type DatabaseConfig struct {
-	Driver          string `mapstructure:"driver"` // postgres, mysql, sqlite
 	Host            string `mapstructure:"host"`
-	Name            string `mapstructure:"name"` // database name
+	Port            int    `mapstructure:"port"`
 	User            string `mapstructure:"user"`
 	Password        string `mapstructure:"password"`
-	SSLMode         string `mapstructure:"ssl_mode"` // disable, require, verify-full
-	Port            int    `mapstructure:"port"`
+	Name            string `mapstructure:"name"`
+	SSLMode         string `mapstructure:"ssl_mode"`
 	MaxOpenConns    int    `mapstructure:"max_open_conns"`
 	MaxIdleConns    int    `mapstructure:"max_idle_conns"`
 	ConnMaxLifetime int    `mapstructure:"conn_max_lifetime"` // seconds
-	Enabled         bool   `mapstructure:"enabled"`
+}
+
+// GRPCConfig holds the admin/read gRPC server settings (no TriggerUpdate).
+type GRPCConfig struct {
+	Host              string `mapstructure:"host"`
+	Port              int    `mapstructure:"port"`
+	ReflectionEnabled bool   `mapstructure:"reflection_enabled"`
+}
+
+// HealthzConfig holds the /healthz, /readyz, /metrics listener settings.
+type HealthzConfig struct {
+	Host string `mapstructure:"host"`
+	Port int    `mapstructure:"port"`
+}
+
+// ChainConfig holds settings for the single target chain (Ethereum Sepolia per
+// task 04 deployment; spec says Base Sepolia but the contracts repo deployed to
+// Ethereum Sepolia — same flag the indexer task records).
+type ChainConfig struct {
+	Name                string            `mapstructure:"name"`
+	ChainID             uint64            `mapstructure:"chain_id"`
+	RPCURL              string            `mapstructure:"rpc_url"`
+	RegistryAddress     string            `mapstructure:"registry_address"`
+	AggregatorAddresses map[string]string `mapstructure:"aggregator_addresses"` // assetID (e.g. "WETH") -> hex address
+}
+
+// PriceClientConfig holds the price-service gRPC client settings.
+type PriceClientConfig struct {
+	Address       string `mapstructure:"address"`
+	TimeoutSec    int    `mapstructure:"timeout_sec"`
+}
+
+// IndexerClientConfig holds the indexer-service gRPC client settings.
+type IndexerClientConfig struct {
+	Address    string `mapstructure:"address"`
+	TimeoutSec int    `mapstructure:"timeout_sec"`
+}
+
+// StreamConfig holds the indexer.StreamEvents consumer settings.
+type StreamConfig struct {
+	BackfillFromBlock   uint64 `mapstructure:"backfill_from_block"`
+	ReconnectBackoffSec int    `mapstructure:"reconnect_backoff_sec"`
+	ReconnectMaxBackoffSec int `mapstructure:"reconnect_max_backoff_sec"`
+}
+
+// SignerConfig holds reporter-key loading settings.
+type SignerConfig struct {
+	ReporterKeyPaths     []string `mapstructure:"reporter_key_paths"`
+	ReporterAddresses    []string `mapstructure:"reporter_addresses"` // expected EOA addresses (checklist)
+	Threshold            int      `mapstructure:"threshold"`
+	AllowInsecurePerms   bool     `mapstructure:"allow_insecure_perms"` // dev-only escape hatch; production must keep this false
+}
+
+// SubmissionConfig holds on-chain submission retry + gas settings.
+type SubmissionConfig struct {
+	MaxRetries       int     `mapstructure:"max_retries"`
+	ReplaceAfterSec  int     `mapstructure:"replace_after_sec"`
+	GasMultiplier    float64 `mapstructure:"gas_multiplier"`
+	ConfirmTimeoutSec int    `mapstructure:"confirm_timeout_sec"`
+}
+
+// HeartbeatConfig holds per-asset heartbeat scheduler defaults.
+type HeartbeatConfig struct {
+	IntervalSec        int     `mapstructure:"interval_sec"`
+	DeviationThreshold float64 `mapstructure:"deviation_threshold"`
+	Enabled            bool    `mapstructure:"enabled"`
+}
+
+// ConversionConfig holds float-to-int256 settings.
+type ConversionConfig struct {
+	OnChainDecimals int `mapstructure:"on_chain_decimals"`
+}
+
+// TelemetryConfig holds logging + metrics flags.
+type TelemetryConfig struct {
+	LogLevel  string `mapstructure:"log_level"`
+	LogFormat string `mapstructure:"log_format"` // "json" or "text"
 }

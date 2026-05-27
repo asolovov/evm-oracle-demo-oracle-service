@@ -1,91 +1,160 @@
-// Package config defines application configuration defaults and schema.
 package config
 
 import (
+	"errors"
+	"fmt"
+
 	"github.com/spf13/viper"
 )
 
-// init initialize default config params.
+// init registers viper defaults at package load.
 //
-//nolint:gochecknoinits // configuration defaults are registered at package load.
+// Per architecture rule 6, viper.SetDefault is mandatory for every nested key
+// the service reads — AutomaticEnv alone does NOT populate nested keys on
+// Unmarshal. SetDefault is also machine-discoverable documentation:
+// `grep "SetDefault" config/` enumerates the entire env-var surface.
+//
+//nolint:gochecknoinits // config defaults registered at package load
 func init() {
 	setDefaults()
 }
 
-// setDefaults exposes default registration for testing.
-// Keep defaults centralized here so tests can reset viper and reapply them.
+// setDefaults registers viper defaults for every Scheme key.
+// Required-but-empty keys default to the zero value and are caught by Validate.
 func setDefaults() {
-	// Core application defaults
-	viper.SetDefault("env", "prod")
-
-	// Database/Repository module defaults
-	viper.SetDefault("database.enabled", false)
-	viper.SetDefault("database.driver", "postgres")
+	// Database.
 	viper.SetDefault("database.host", "localhost")
 	viper.SetDefault("database.port", 5432)
+	viper.SetDefault("database.user", "oracle_user")
+	viper.SetDefault("database.password", "")
+	viper.SetDefault("database.name", "evm_oracle")
 	viper.SetDefault("database.ssl_mode", "disable")
-	viper.SetDefault("database.max_open_conns", 25)
-	viper.SetDefault("database.max_idle_conns", 5)
+	viper.SetDefault("database.max_open_conns", 10)
+	viper.SetDefault("database.max_idle_conns", 2)
 	viper.SetDefault("database.conn_max_lifetime", 300)
-	viper.SetDefault("database.user", "dev")
-	viper.SetDefault("database.password", "dev")
-	viper.SetDefault("database.name", "microservices_dev")
 
-	// gRPC module defaults
-	viper.SetDefault("grpc.enabled", false)
+	// gRPC server.
 	viper.SetDefault("grpc.host", "0.0.0.0")
 	viper.SetDefault("grpc.port", 9090)
-	viper.SetDefault("grpc.timeout", "30s")
-	viper.SetDefault("grpc.max_send_msg_size", 60*1024*1024)
-	viper.SetDefault("grpc.max_recv_msg_size", 60*1024*1024)
-	viper.SetDefault("grpc.num_stream_workers", 0)
+	viper.SetDefault("grpc.reflection_enabled", true)
 
-	// gRPC Client module defaults
-	viper.SetDefault("grpc_client.enabled", false)
-	viper.SetDefault("grpc_client.address", "localhost:9090")
-	viper.SetDefault("grpc_client.timeout", "30s")
-	viper.SetDefault("grpc_client.keep_alive.time", "10s")
-	viper.SetDefault("grpc_client.keep_alive.timeout", "1s")
-	viper.SetDefault("grpc_client.keep_alive.permit_without_stream", true)
+	// Healthz / metrics listener.
+	viper.SetDefault("healthz.host", "0.0.0.0")
+	viper.SetDefault("healthz.port", 8080)
 
-	// HTTP module defaults
-	viper.SetDefault("http.enabled", false)
-	viper.SetDefault("http.host", "0.0.0.0")
-	viper.SetDefault("http.port", 8080)
-	viper.SetDefault("http.timeout", "30s")
-	viper.SetDefault("http.swagger_spec", "./api/swagger.yaml")
-	viper.SetDefault("http.mock_auth", false)
-	viper.SetDefault("http.admin_emails", []string{})
+	// Chain.
+	viper.SetDefault("chain.name", "sepolia")
+	viper.SetDefault("chain.chain_id", 11155111)
+	viper.SetDefault("chain.rpc_url", "")
+	viper.SetDefault("chain.registry_address", "")
+	viper.SetDefault("chain.aggregator_addresses", map[string]string{})
 
-	// CORS defaults
-	viper.SetDefault("http.cors.enabled", true)
-	viper.SetDefault("http.cors.allowed_origins", []string{"*"})
-	viper.SetDefault("http.cors.allowed_methods", []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"})
-	viper.SetDefault("http.cors.allowed_headers", []string{"*"})
-	viper.SetDefault("http.cors.max_age", 3600)
+	// Price-service client.
+	viper.SetDefault("price.address", "price-service:9090")
+	viper.SetDefault("price.timeout_sec", 5)
 
-	// Rate limit defaults
-	viper.SetDefault("http.rate_limit.enabled", false)
-	viper.SetDefault("http.rate_limit.requests_per_sec", 100.0)
-	viper.SetDefault("http.rate_limit.burst", 20)
+	// Indexer-service client.
+	viper.SetDefault("indexer.address", "indexer-service:9090")
+	viper.SetDefault("indexer.timeout_sec", 30)
 
-	// Gatekeeper defaults (for future use)
-	viper.SetDefault("http.gatekeeper.address", "localhost:9091")
-	viper.SetDefault("http.gatekeeper.timeout", "5s")
+	// Stream consumer.
+	viper.SetDefault("stream.backfill_from_block", 0)
+	viper.SetDefault("stream.reconnect_backoff_sec", 1)
+	viper.SetDefault("stream.reconnect_max_backoff_sec", 30)
 
-	// WebSocket module defaults
-	viper.SetDefault("websocket.enabled", false)
-	viper.SetDefault("websocket.host", "0.0.0.0")
-	viper.SetDefault("websocket.port", 8081)
-	viper.SetDefault("websocket.timeout", "30s")
-	viper.SetDefault("websocket.read_buffer_size", 1024)
-	viper.SetDefault("websocket.write_buffer_size", 1024)
-	viper.SetDefault("websocket.max_message_size", 512000) // 500KB
-	viper.SetDefault("websocket.ping_interval", "54s")
-	viper.SetDefault("websocket.pong_wait", "60s")
-	viper.SetDefault("websocket.write_wait", "10s")
+	// Signer.
+	viper.SetDefault("signer.reporter_key_paths", []string{})
+	viper.SetDefault("signer.reporter_addresses", []string{})
+	viper.SetDefault("signer.threshold", 2)
+	viper.SetDefault("signer.allow_insecure_perms", false)
 
-	// WebSocket connection limits
-	viper.SetDefault("websocket.limits.max_connections", 0)          // 0 = unlimited
-	viper.SetDefault("websocket.limits.max_connections_per_room", 0) // 0 = unlimited
+	// Submission.
+	viper.SetDefault("submission.max_retries", 3)
+	viper.SetDefault("submission.replace_after_sec", 60)
+	viper.SetDefault("submission.gas_multiplier", 1.1)
+	viper.SetDefault("submission.confirm_timeout_sec", 300)
+
+	// Heartbeat.
+	viper.SetDefault("heartbeat.enabled", true)
+	viper.SetDefault("heartbeat.interval_sec", 3600)
+	viper.SetDefault("heartbeat.deviation_threshold", 0.015)
+
+	// Conversion (Chainlink 8 decimals).
+	viper.SetDefault("conversion.on_chain_decimals", 8)
+
+	// Telemetry.
+	viper.SetDefault("telemetry.log_level", "info")
+	viper.SetDefault("telemetry.log_format", "json")
+}
+
+// Validate fails fast on missing or out-of-range required keys.
+// Called from App.Init() — see internal/application.go.
+func (s *Scheme) Validate() error {
+	var errs []error
+
+	if s.Database.Password == "" {
+		errs = append(errs, errors.New("database.password is required"))
+	}
+	if s.Database.Name == "" {
+		errs = append(errs, errors.New("database.name is required"))
+	}
+
+	if s.Chain.RPCURL == "" {
+		errs = append(errs, errors.New("chain.rpc_url is required"))
+	}
+	if s.Chain.ChainID == 0 {
+		errs = append(errs, errors.New("chain.chain_id is required"))
+	}
+	if s.Chain.RegistryAddress == "" {
+		errs = append(errs, errors.New("chain.registry_address is required"))
+	}
+	if len(s.Chain.AggregatorAddresses) == 0 {
+		errs = append(errs, errors.New("chain.aggregator_addresses must not be empty"))
+	}
+
+	if s.Price.Address == "" {
+		errs = append(errs, errors.New("price.address is required"))
+	}
+	if s.Indexer.Address == "" {
+		errs = append(errs, errors.New("indexer.address is required"))
+	}
+
+	if len(s.Signer.ReporterKeyPaths) == 0 {
+		errs = append(errs, errors.New("signer.reporter_key_paths is required"))
+	}
+	if s.Signer.Threshold <= 0 {
+		errs = append(errs, errors.New("signer.threshold must be > 0"))
+	}
+	if s.Signer.Threshold > len(s.Signer.ReporterKeyPaths) {
+		errs = append(errs, fmt.Errorf("signer.threshold (%d) must be <= len(signer.reporter_key_paths) (%d)",
+			s.Signer.Threshold, len(s.Signer.ReporterKeyPaths)))
+	}
+	if len(s.Signer.ReporterAddresses) > 0 && len(s.Signer.ReporterAddresses) != len(s.Signer.ReporterKeyPaths) {
+		errs = append(errs, errors.New("signer.reporter_addresses, when set, must match signer.reporter_key_paths length"))
+	}
+
+	if s.Submission.MaxRetries < 0 {
+		errs = append(errs, errors.New("submission.max_retries must be >= 0"))
+	}
+	if s.Submission.ReplaceAfterSec <= 0 {
+		errs = append(errs, errors.New("submission.replace_after_sec must be > 0"))
+	}
+	if s.Submission.GasMultiplier < 1.0 {
+		errs = append(errs, errors.New("submission.gas_multiplier must be >= 1.0"))
+	}
+
+	if s.Conversion.OnChainDecimals <= 0 || s.Conversion.OnChainDecimals > 18 {
+		errs = append(errs, errors.New("conversion.on_chain_decimals must be in (0, 18]"))
+	}
+
+	if s.Heartbeat.Enabled {
+		if s.Heartbeat.IntervalSec <= 0 {
+			errs = append(errs, errors.New("heartbeat.interval_sec must be > 0 when heartbeat.enabled"))
+		}
+		if s.Heartbeat.DeviationThreshold < 0 {
+			errs = append(errs, errors.New("heartbeat.deviation_threshold must be >= 0"))
+		}
+	}
+
+	return errors.Join(errs...)
 }

@@ -1,220 +1,361 @@
-// Package internal contains the core application wiring.
+// Package internal contains the core application wiring for the oracle-service.
 package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
-	"microservice-template/config"
-	grpcmod "microservice-template/internal/grpc"
-	grpcclientmod "microservice-template/internal/grpcclient"
-	httpmod "microservice-template/internal/http"
-	"microservice-template/internal/module"
-	"microservice-template/internal/repository"
-	"microservice-template/internal/service"
-	wsmod "microservice-template/internal/websocket"
-	"microservice-template/pkg/logger"
-	"microservice-template/pkg/version"
+	"github.com/sirupsen/logrus"
+
+	"github.com/asolovov/evm-oracle-demo-oracle-service/config"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/chain"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/grpcclient"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/grpcsrv"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/healthz"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/heartbeat"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/metrics"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/module"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/repository"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/signer"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/streamconsumer"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/submitter"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/pkg/logger"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/pkg/version"
 )
 
-// App is the main microservice application instance.
+// App is the oracle-service application instance.
+//
+// Per architecture rule 2, this file is the sole construction site for
+// dependencies. Construction order tracks the dependency graph documented
+// in spec §3.2 / task 06 step 7:
+//
+//	DB pool -> repository
+//	         -> reporter signer (loaded from disk)
+//	         -> chain client (dials RPC + verifies chain id)
+//	         -> price-service gRPC client
+//	         -> indexer-service gRPC client
+//	         -> submitter (event/heartbeat handler)
+//	         -> stream consumer (only after submitter so events have a destination)
+//	         -> gRPC server (admin + read only)
+//	         -> heartbeat scheduler
+//	         -> healthz + metrics listener
 type App struct {
-	config  *config.Scheme
+	cfg     *config.Scheme
 	version *version.Version
 	modules *module.Manager
+	log     *logrus.Entry
 
-	// Services (exposed to transports like HTTP/gRPC)
-	// Will be nil if dependent modules (e.g., repository) are not enabled.
-	svc service.IService
+	// Constructed components — held so Stop() can drain in reverse order.
+	repoModule      *repository.Module
+	repo            *repository.PgxRepository
+	priceClient     *grpcclient.PriceClient
+	indexerClient   *grpcclient.IndexerClient
+	chainClient     *chain.Client
+	signer          *signer.Signer
+	submitter       *submitter.Submitter
+	streamConsumer  *streamconsumer.Consumer
+	grpcServer      *grpcsrv.Server
+	heartbeatSched  *heartbeat.Scheduler
+	healthz         *healthz.Server
+	metrics         *metrics.Metrics
+
+	// Coordination.
+	grpcDone    chan error
+	healthzDone chan error
+	stoppedOnce sync.Once
 }
 
-// NewApplication creates a new App instance.
-func NewApplication() (app *App, err error) {
+// NewApplication creates an App with a zero config (filled by cmd/root via viper).
+func NewApplication() (*App, error) {
 	ver, err := version.NewVersion()
 	if err != nil {
 		return nil, fmt.Errorf("init app version: %w", err)
 	}
 
 	return &App{
-		config:  &config.Scheme{},
-		version: ver,
-		modules: module.NewManager(),
+		cfg:         &config.Scheme{},
+		version:     ver,
+		modules:     module.NewManager(),
+		log:         logger.Log().WithField("component", "application"),
+		grpcDone:    make(chan error, 1),
+		healthzDone: make(chan error, 1),
 	}, nil
 }
 
-// Init initializes the application and all registered modules.
+// Init validates configuration and constructs every component.
 func (app *App) Init() error {
-	// Register and initialize modules based on configuration
-	// Note: registerModules handles both registration and initialization
-	// in the correct order to ensure dependencies are available
-	if err := app.registerModules(); err != nil {
-		return fmt.Errorf("register modules: %w", err)
+	if err := app.cfg.Validate(); err != nil {
+		return fmt.Errorf("validate config: %w", err)
 	}
 
-	return nil
-}
-
-// registerModules registers enabled modules based on configuration.
-// Modules are registered in dependency order:
-// 1. Infrastructure (database, cache, queue).
-// 2. Business logic (repositories, services).
-// 3. Transport (http, grpc).
-//
-//nolint:gocyclo // should decompose later
-func (app *App) registerModules() error {
-	// 1. Infrastructure: Repository (database-backed) is optional
-	var repoModule *repository.Module
-	if app.config.Database != nil && app.config.Database.Enabled {
-		logger.Log().Info("database enabled, registering repository module")
-
-		repoModule = repository.NewModule(app.config.Database)
-		app.modules.Register(repoModule)
-	}
-
-	// 2. Infrastructure: gRPC Client for external services (optional)
-	var grpcClientModule *grpcclientmod.Module
-	if app.config.GRPCClient != nil && app.config.GRPCClient.Enabled {
-		logger.Log().Info("grpc_client enabled, registering grpc client module")
-
-		grpcClientModule = grpcclientmod.NewModule(app.config.GRPCClient)
-		app.modules.Register(grpcClientModule)
-	}
-
-	// 3. Business logic: Service module is always registered; repository may be nil
-	logger.Log().Info("registering service module")
-
-	// Pass repository module as provider; service will retrieve repository during Init
-	// (after repository module has been initialized).
-	// Explicitly pass nil to avoid typed nil interface gotcha.
-	var repoProvider service.RepositoryProvider
-	if repoModule != nil {
-		repoProvider = repoModule
-	}
-	svcModule := service.NewModule(repoProvider)
-	app.modules.Register(svcModule)
-
-	// Initialize infrastructure and business logic modules first
-	// so we can retrieve the service instance for transport modules
-	ctx := context.Background()
-	if repoModule != nil {
-		if err := repoModule.Init(ctx); err != nil {
-			return fmt.Errorf("init repository module: %w", err)
-		}
-	}
-	if grpcClientModule != nil {
-		if err := grpcClientModule.Init(ctx); err != nil {
-			return fmt.Errorf("init grpc client module: %w", err)
-		}
-	}
-	if err := svcModule.Init(ctx); err != nil {
-		return fmt.Errorf("init service module: %w", err)
-	}
-
-	// Capture service instance after initialization
-	app.svc = svcModule.Service()
-
-	logger.Log().Info("infrastructure modules initialized successfully")
-
-	// 4. Transport: HTTP module (optional) - receives both service AND grpcClient
-	if app.config.HTTP != nil && app.config.HTTP.Enabled {
-		logger.Log().Info("http enabled, registering http module")
-
-		// Pass grpcClient to HTTP module (can be nil)
-		httpModule := httpmod.NewModule(app.config.HTTP, app.svc, grpcClientModule)
-		app.modules.Register(httpModule)
-
-		// Initialize HTTP module
-		if err := httpModule.Init(ctx); err != nil {
-			return fmt.Errorf("init http module: %w", err)
-		}
-	}
-
-	// 5. Transport: gRPC server module (optional)
-	if app.config.GRPC != nil && app.config.GRPC.Enabled {
-		logger.Log().Info("grpc enabled, registering grpc module")
-
-		grpcModule := grpcmod.NewModule(app.config.GRPC, app.svc)
-		app.modules.Register(grpcModule)
-
-		// Initialize gRPC module
-		if err := grpcModule.Init(ctx); err != nil {
-			return fmt.Errorf("init grpc module: %w", err)
-		}
-	}
-
-	// 6. Transport: WebSocket server module (optional)
-	if app.config.WebSocket != nil && app.config.WebSocket.Enabled {
-		logger.Log().Info("websocket enabled, registering websocket module")
-
-		wsModule := wsmod.NewModule(app.config.WebSocket, app.svc)
-		app.modules.Register(wsModule)
-
-		// Initialize WebSocket module
-		if err := wsModule.Init(ctx); err != nil {
-			return fmt.Errorf("init websocket module: %w", err)
-		}
-	}
-
-	logger.Log().Infof("registered and initialized %d modules", app.modules.Count())
-	return nil
-}
-
-// Serve starts all modules and waits for shutdown signal.
-func (app *App) Serve() error {
-	ctx := context.Background()
-
-	// Start all modules
-	if err := app.modules.StartAll(ctx); err != nil {
-		return fmt.Errorf("start modules: %w", err)
-	}
-
-	logger.Log().Info("application is running, press Ctrl+C to stop")
-
-	// Wait for shutdown signal
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-
-	<-quit
-	logger.Log().Info("shutdown signal received, stopping gracefully...")
-
-	return nil
-}
-
-// Stop gracefully shuts down all modules.
-func (app *App) Stop() error {
-	// Create context with timeout for graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	return app.modules.StopAll(ctx)
+	// 1. Metrics registry.
+	app.metrics = metrics.New()
+
+	// 2. Repository — registered with the module manager so health-check
+	// aggregation and reverse-order Stop fall out for free (matches the
+	// indexer service's shape).
+	repoModule := repository.NewModule(&app.cfg.Database)
+	if err := repoModule.Init(ctx); err != nil {
+		return fmt.Errorf("repository: %w", err)
+	}
+	app.modules.Register(repoModule)
+	app.repoModule = repoModule
+	repo := repoModule.Repo()
+	app.repo = repo
+
+	// 3. Signer (reads keys from disk + enforces perms).
+	sgn, err := signer.LoadFromConfig(&app.cfg.Signer, app.cfg.Chain.ChainID)
+	if err != nil {
+		return fmt.Errorf("signer: %w", err)
+	}
+	app.signer = sgn
+
+	// 4. Chain client (dials RPC; verifies chain id).
+	cc, err := chain.Dial(ctx, app.cfg.Chain.RPCURL, app.cfg.Chain.ChainID, app.cfg.Submission.GasMultiplier)
+	if err != nil {
+		return fmt.Errorf("chain client: %w", err)
+	}
+	app.chainClient = cc
+
+	// 5. Outbound gRPC clients.
+	pc, err := grpcclient.DialPrice(ctx, &app.cfg.Price)
+	if err != nil {
+		return fmt.Errorf("price client: %w", err)
+	}
+	app.priceClient = pc
+
+	ic, err := grpcclient.DialIndexer(ctx, &app.cfg.Indexer)
+	if err != nil {
+		return fmt.Errorf("indexer client: %w", err)
+	}
+	app.indexerClient = ic
+
+	// 6. Submitter (depends on signer + chain + price + repo).
+	sub := submitter.New(
+		cc, pc, sgn, repo,
+		&app.cfg.Submission, &app.cfg.Conversion,
+		app.cfg.Chain.AggregatorAddresses,
+		submitter.WithLogger(app.log.WithField("component", "submitter")),
+		submitter.WithMetricsHooks(
+			func(asset, st string) { app.metrics.SubmissionsTotal.WithLabelValues(asset, st).Inc() },
+			func(gas uint64) { app.metrics.GasUsed.Observe(float64(gas)) },
+		),
+	)
+	app.submitter = sub
+
+	// 7. Stream consumer (started AFTER submitter wiring).
+	sc := streamconsumer.New(
+		ic.StreamClient(), repo, sub, &app.cfg.Stream,
+		streamconsumer.WithLogger(app.log.WithField("component", "streamconsumer")),
+		streamconsumer.WithMetricsHooks(
+			func(kind string) { app.metrics.StreamEventsReceived.WithLabelValues(kind).Inc() },
+			func() { app.metrics.StreamReconnectTotal.Inc() },
+			func(lag float64) { app.metrics.StreamLagSeconds.Set(lag) },
+		),
+	)
+	app.streamConsumer = sc
+
+	// 8. Heartbeat scheduler.
+	hb := heartbeat.New(
+		&app.cfg.Heartbeat, &app.cfg.Conversion,
+		pc, cc, repo, sub, sub,
+		heartbeat.WithLogger(app.log.WithField("component", "heartbeat")),
+		heartbeat.WithSkippedCounter(func(sym string) {
+			app.metrics.HeartbeatSkippedTotal.WithLabelValues(sym).Inc()
+		}),
+	)
+	app.heartbeatSched = hb
+
+	// 9. gRPC server (admin + read only).
+	gs := grpcsrv.New(&app.cfg.GRPC, repo, repo, app.log.WithField("component", "grpcsrv"))
+	app.grpcServer = gs
+
+	// 10. Healthz / metrics listener.
+	app.healthz = healthz.New(
+		&app.cfg.Healthz,
+		app.metrics.Registry,
+		app.readiness,
+		app.log.WithField("component", "healthz"),
+	)
+
+	// Reporter address gauge (best-effort balance read at startup).
+	weiPerEth := new(big.Float).SetPrec(256).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+	for _, addr := range sgn.Reporters() {
+		bal, err := cc.BalanceAt(ctx, addr)
+		if err == nil && bal != nil {
+			// Express in ETH for human-readable scraping. 1e18 wei == 1 ETH.
+			eth := new(big.Float).SetInt(bal)
+			eth.Quo(eth, weiPerEth)
+			fl, _ := eth.Float64()
+			app.metrics.ReporterBalance.WithLabelValues(addr.Hex()).Set(fl)
+		}
+	}
+
+	app.log.Info("application initialized")
+	return nil
 }
 
-// Config returns the application configuration.
-func (app *App) Config() *config.Scheme {
-	return app.config
+// Serve starts every long-running component and blocks until a shutdown
+// signal is received.
+func (app *App) Serve() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start gRPC server.
+	go func() { app.grpcDone <- app.grpcServer.Serve() }()
+
+	// Start healthz listener.
+	go func() { app.healthzDone <- app.healthz.Serve() }()
+
+	// Start stream consumer + heartbeat.
+	app.streamConsumer.Start(ctx)
+	app.heartbeatSched.Start(ctx)
+
+	app.log.Info("application running; press Ctrl+C to stop")
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+
+	select {
+	case <-quit:
+		app.log.Info("shutdown signal received")
+	case err := <-app.grpcDone:
+		if err != nil {
+			app.log.WithError(err).Error("grpc server exited")
+		}
+	case err := <-app.healthzDone:
+		if err != nil {
+			app.log.WithError(err).Error("healthz server exited")
+		}
+	}
+	return nil
 }
 
-// Version returns the application version string.
-func (app *App) Version() string {
-	return app.version.String()
+// Stop drains components in reverse construction order.
+func (app *App) Stop() error {
+	var stopErr error
+	app.stoppedOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		stopErr = errors.Join(
+			app.stopHeartbeat(ctx),
+			app.stopStream(ctx),
+			app.stopGRPC(ctx),
+			app.stopHealthz(ctx),
+			app.stopSubmitter(),
+			app.closeIndexer(),
+			app.closePrice(),
+			app.closeChain(),
+			app.closeRepo(),
+		)
+	})
+	return stopErr
 }
 
-// Modules returns the module manager (useful for health checks).
-func (app *App) Modules() *module.Manager {
-	return app.modules
+func (app *App) stopHeartbeat(ctx context.Context) error {
+	if app.heartbeatSched == nil {
+		return nil
+	}
+	return app.heartbeatSched.Stop(ctx)
 }
 
-// Service returns the service instance.
-// Service is always registered; methods may fail if dependencies are unavailable.
-func (app *App) Service() service.IService {
-	return app.svc
+func (app *App) stopStream(ctx context.Context) error {
+	if app.streamConsumer == nil {
+		return nil
+	}
+	return app.streamConsumer.Stop(ctx)
 }
 
-// CreateAddr creates an address string from host and port.
-func CreateAddr(host string, port int) string {
-	return fmt.Sprintf("%s:%v", host, port)
+func (app *App) stopGRPC(ctx context.Context) error {
+	if app.grpcServer == nil {
+		return nil
+	}
+	return app.grpcServer.Stop(ctx)
+}
+
+func (app *App) stopHealthz(ctx context.Context) error {
+	if app.healthz == nil {
+		return nil
+	}
+	return app.healthz.Stop(ctx)
+}
+
+func (app *App) stopSubmitter() error {
+	if app.submitter == nil {
+		return nil
+	}
+	app.submitter.Wait()
+	return nil
+}
+
+func (app *App) closeIndexer() error {
+	if app.indexerClient == nil {
+		return nil
+	}
+	return app.indexerClient.Close()
+}
+
+func (app *App) closePrice() error {
+	if app.priceClient == nil {
+		return nil
+	}
+	return app.priceClient.Close()
+}
+
+func (app *App) closeChain() error {
+	if app.chainClient != nil {
+		app.chainClient.Close()
+	}
+	return nil
+}
+
+func (app *App) closeRepo() error {
+	if app.repoModule == nil {
+		// Fallback for fail-fast paths where the module wrapper never landed.
+		if app.repo != nil {
+			app.repo.Close()
+		}
+		return nil
+	}
+	return app.repoModule.Stop(context.Background())
+}
+
+// Config exposes the loaded configuration.
+func (app *App) Config() *config.Scheme { return app.cfg }
+
+// Version returns the formatted version string.
+func (app *App) Version() string { return app.version.String() }
+
+// Modules returns the module manager. The repository is the one registered
+// module; other components are wired directly in application.go since they
+// lifecycle as Init+goroutine rather than the Init/Start/Stop module shape.
+func (app *App) Modules() *module.Manager { return app.modules }
+
+// readiness is the closure healthz exposes on /readyz. Returns nil iff every
+// load-bearing dependency reports healthy. Walks every registered module via
+// the manager and aggregates errors so a future module addition lights up
+// /readyz without touching this site.
+func (app *App) readiness(ctx context.Context) error {
+	results := app.modules.HealthCheckAll(ctx)
+	var errs []error
+	for name, err := range results {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }
