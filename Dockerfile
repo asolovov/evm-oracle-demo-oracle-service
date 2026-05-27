@@ -7,7 +7,7 @@
 # the image — they are mounted at runtime from /etc/lighthouse/secrets/
 # (or a docker secret) per spec §3.2 and rule 5.
 
-FROM golang:1.24-bookworm AS builder
+FROM golang:1.25-bookworm AS builder
 
 WORKDIR /src
 

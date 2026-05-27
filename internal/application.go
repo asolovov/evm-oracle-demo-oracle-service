@@ -53,6 +53,7 @@ type App struct {
 	log     *logrus.Entry
 
 	// Constructed components — held so Stop() can drain in reverse order.
+	repoModule      *repository.Module
 	repo            *repository.PgxRepository
 	priceClient     *grpcclient.PriceClient
 	indexerClient   *grpcclient.IndexerClient
@@ -100,11 +101,16 @@ func (app *App) Init() error {
 	// 1. Metrics registry.
 	app.metrics = metrics.New()
 
-	// 2. Repository.
-	repo, err := repository.NewPgxRepository(ctx, &app.cfg.Database)
-	if err != nil {
+	// 2. Repository — registered with the module manager so health-check
+	// aggregation and reverse-order Stop fall out for free (matches the
+	// indexer service's shape).
+	repoModule := repository.NewModule(&app.cfg.Database)
+	if err := repoModule.Init(ctx); err != nil {
 		return fmt.Errorf("repository: %w", err)
 	}
+	app.modules.Register(repoModule)
+	app.repoModule = repoModule
+	repo := repoModule.Repo()
 	app.repo = repo
 
 	// 3. Signer (reads keys from disk + enforces perms).
@@ -315,10 +321,14 @@ func (app *App) closeChain() error {
 }
 
 func (app *App) closeRepo() error {
-	if app.repo != nil {
-		app.repo.Close()
+	if app.repoModule == nil {
+		// Fallback for fail-fast paths where the module wrapper never landed.
+		if app.repo != nil {
+			app.repo.Close()
+		}
+		return nil
 	}
-	return nil
+	return app.repoModule.Stop(context.Background())
 }
 
 // Config exposes the loaded configuration.
@@ -327,18 +337,25 @@ func (app *App) Config() *config.Scheme { return app.cfg }
 // Version returns the formatted version string.
 func (app *App) Version() string { return app.version.String() }
 
-// Modules returns the module manager (reserved for future template-style
-// modules; the oracle-service currently wires everything directly here).
+// Modules returns the module manager. The repository is the one registered
+// module; other components are wired directly in application.go since they
+// lifecycle as Init+goroutine rather than the Init/Start/Stop module shape.
 func (app *App) Modules() *module.Manager { return app.modules }
 
 // readiness is the closure healthz exposes on /readyz. Returns nil iff every
-// load-bearing dependency is reachable.
+// load-bearing dependency reports healthy. Walks every registered module via
+// the manager and aggregates errors so a future module addition lights up
+// /readyz without touching this site.
 func (app *App) readiness(ctx context.Context) error {
-	if app.repo == nil {
-		return errors.New("repository not initialized")
+	results := app.modules.HealthCheckAll(ctx)
+	var errs []error
+	for name, err := range results {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+		}
 	}
-	if err := app.repo.Ping(ctx); err != nil {
-		return fmt.Errorf("db: %w", err)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	return nil
 }
