@@ -5,7 +5,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"microservice-template/internal/models"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/models"
 )
 
 // IClient defines the interface for gRPC client operations.

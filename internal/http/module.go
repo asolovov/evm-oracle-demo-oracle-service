@@ -11,15 +11,15 @@ import (
 	"github.com/go-openapi/loads"
 	"github.com/justinas/alice"
 
-	"microservice-template/config"
-	"microservice-template/internal/grpcclient"
-	"microservice-template/internal/http/auth"
-	"microservice-template/internal/http/handlers"
-	"microservice-template/internal/http/middlewares"
-	httpserver "microservice-template/internal/http/server"
-	"microservice-template/internal/http/server/operations"
-	"microservice-template/internal/service"
-	"microservice-template/pkg/logger"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/config"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/grpcclient"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/http/auth"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/http/handlers"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/http/middlewares"
+	httpserver "github.com/asolovov/evm-oracle-demo-oracle-service/internal/http/server"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/http/server/operations"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/service"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/pkg/logger"
 )
 
 // Module implements module.Module interface for the HTTP server.
@@ -28,7 +28,7 @@ type Module struct {
 	service    service.IService
 	grpcClient grpcclient.IClient
 	server     *httpserver.Server
-	api        *operations.MicroserviceTemplateAPIAPI
+	api        *operations.EvmOracleDemoOracleServiceAPIAPI
 	handler    *http.Handler
 	auth       *auth.Auth
 }
@@ -112,7 +112,7 @@ func (m *Module) initAPI() error {
 	}
 
 	// Create API instance
-	api := operations.NewMicroserviceTemplateAPIAPI(swaggerSpec)
+	api := operations.NewEvmOracleDemoOracleServiceAPIAPI(swaggerSpec)
 
 	// Configure logger
 	api.Logger = logger.Log().Infof

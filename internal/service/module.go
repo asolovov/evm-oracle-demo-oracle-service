@@ -4,8 +4,8 @@ package service
 import (
 	"context"
 
-	"microservice-template/internal/repository"
-	"microservice-template/pkg/logger"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/repository"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/pkg/logger"
 )
 
 // RepositoryProvider provides access to a repository instance.

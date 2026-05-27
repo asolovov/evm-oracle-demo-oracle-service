@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"microservice-template/config"
-	domainmodels "microservice-template/internal/models"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/config"
+	domainmodels "github.com/asolovov/evm-oracle-demo-oracle-service/internal/models"
 )
 
 // mockService is a mock implementation of service.IService for testing.

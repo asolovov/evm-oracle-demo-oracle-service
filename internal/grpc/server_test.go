@@ -3,7 +3,7 @@ package grpc
 import (
 	"testing"
 
-	"microservice-template/config"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/config"
 )
 
 func TestNewServer_ValidConfig(t *testing.T) {

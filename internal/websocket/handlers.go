@@ -6,8 +6,8 @@ import (
 	"errors"
 	"time"
 
-	"microservice-template/internal/service"
-	"microservice-template/pkg/logger"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/service"
+	"github.com/asolovov/evm-oracle-demo-oracle-service/pkg/logger"
 )
 
 // MessageHandlers handles incoming WebSocket messages.
