@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 
@@ -110,6 +111,34 @@ func (s *Signer) Reporters() []common.Address {
 
 // Threshold returns the configured M-of-N threshold.
 func (s *Signer) Threshold() int { return s.threshold }
+
+// BroadcasterAddress is the EOA the chain client uses to broadcast
+// fulfillPrice transactions. The contracts do not check msg.sender (the
+// digest signature set is the sole authorisation), so we reuse the first
+// reporter key for broadcasting. This keeps the demo at three funded
+// wallets instead of four.
+func (s *Signer) BroadcasterAddress() common.Address {
+	if len(s.reporters) == 0 {
+		return common.Address{}
+	}
+	return s.reporters[0].Address
+}
+
+// NewBroadcaster returns a *bind.TransactOpts configured for the first
+// reporter key. Callers are expected to set GasTipCap / GasFeeCap / Nonce
+// before broadcasting; this helper only seals the from-address + signer.
+//
+// (Imported above lazily because TransactOpts lives in accounts/abi/bind.)
+func (s *Signer) NewBroadcaster() (*bind.TransactOpts, error) {
+	if len(s.reporters) == 0 {
+		return nil, errors.New("no reporter keys loaded; cannot build broadcaster")
+	}
+	opts, err := bind.NewKeyedTransactorWithChainID(s.reporters[0].privateKey, s.chainID)
+	if err != nil {
+		return nil, fmt.Errorf("build keyed transactor: %w", err)
+	}
+	return opts, nil
+}
 
 // BuildDigest mirrors PriceLib.buildDigest. Exposed so the submitter can sign
 // the same digest that the on-chain verifier will recompute.
