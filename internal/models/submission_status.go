@@ -25,9 +25,14 @@ const (
 	SubmissionStatusDropped
 )
 
+// submissionStatusUnknownName is the canonical string for an unrecognized
+// status. Used both as the lookup-table value for SubmissionStatusUnknown
+// and as the String() fallback for out-of-range receivers.
+const submissionStatusUnknownName = "unknown"
+
 // submissionStatusNames is the symmetric String/FromString lookup table.
 var submissionStatusNames = map[SubmissionStatus]string{
-	SubmissionStatusUnknown:   "unknown",
+	SubmissionStatusUnknown:   submissionStatusUnknownName,
 	SubmissionStatusPending:   "pending",
 	SubmissionStatusConfirmed: "confirmed",
 	SubmissionStatusFailed:    "failed",
@@ -48,7 +53,7 @@ func (s SubmissionStatus) String() string {
 	if name, ok := submissionStatusNames[s]; ok {
 		return name
 	}
-	return "unknown"
+	return submissionStatusUnknownName
 }
 
 // IsValid reports whether s is a defined non-unknown variant.

@@ -78,11 +78,14 @@ func (s *Server) Stop(ctx context.Context) error {
 	return s.srv.Shutdown(ctx)
 }
 
+// JSON field key used across the three probe responses.
+const statusKey = "status"
+
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":  "ok",
+		statusKey: "ok",
 		"author":  "Andrei Solovov",
 		"contact": "https://github.com/asolovov",
 	})
@@ -92,17 +95,17 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if s.readiness == nil {
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+		_ = json.NewEncoder(w).Encode(map[string]string{statusKey: "ready"})
 		return
 	}
 	if err := s.readiness(r.Context()); err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status": "not-ready",
-			"reason": err.Error(),
+			statusKey: "not-ready",
+			"reason":  err.Error(),
 		})
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+	_ = json.NewEncoder(w).Encode(map[string]string{statusKey: "ready"})
 }
