@@ -1,0 +1,26 @@
+# Service-owned codegen config. Per architecture rule 9, the protocols/
+# subtree is proto-source + lint-config only; every consuming service owns
+# its own buf.gen.yaml, Makefile codegen target, gitignored output dir, and
+# pinned codegen plugin versions.
+#
+# `managed.go_package_prefix` retargets every proto's go_package option from
+# the upstream module path (github.com/asolovov/evm-oracle-demo-protocols/...)
+# onto this service's internal/genproto/ tree, so generated imports resolve
+# inside this go.mod without any `replace` directive.
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/asolovov/evm-oracle-demo-oracle-service/internal/genproto
+inputs:
+  - directory: protocols
+plugins:
+  - local: protoc-gen-go
+    out: internal/genproto
+    opt:
+      - paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: internal/genproto
+    opt:
+      - paths=source_relative
