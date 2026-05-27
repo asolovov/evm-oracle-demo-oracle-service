@@ -185,7 +185,7 @@ func (c *Consumer) run(parent context.Context) {
 
 // runOnce opens one StreamEvents session and processes events until the
 // stream ends or returns an error. The returned error signals the caller
-// to reconnect; (nil) signals normal parent-ctx-cancelled shutdown.
+// to reconnect; (nil) signals normal parent-ctx-canceled shutdown.
 func (c *Consumer) runOnce(ctx context.Context) error {
 	fromBlock, err := c.store.GetStreamCursor(ctx)
 	if err != nil {

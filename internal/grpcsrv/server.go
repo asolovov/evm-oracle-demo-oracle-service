@@ -197,7 +197,7 @@ func (s *Server) ListSubmissions(ctx context.Context, req *oraclev1.ListSubmissi
 
 	page := req.GetPage()
 	pageNumber := int32(1)
-	pageSize := int32(limit)
+	pageSize := int32(limit) //nolint:gosec // limit is clamped to maxPageSize (<= int32) by pageBounds
 	if page != nil {
 		if page.GetPage() > 0 {
 			pageNumber = page.GetPage()

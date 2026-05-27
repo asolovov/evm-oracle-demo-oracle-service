@@ -252,7 +252,6 @@ func (s *Submitter) submit(ctx context.Context, symbol string, aggregator common
 	if err != nil {
 		return fmt.Errorf("build transactor opts: %w", err)
 	}
-	//nolint:gosec // nonce is bound by chain state and fits int64 in practice
 	auth.Nonce = new(big.Int).SetUint64(nonce)
 
 	gas, err := s.chain.SuggestGas(ctx, 0)
@@ -299,10 +298,9 @@ func (s *Submitter) submit(ctx context.Context, symbol string, aggregator common
 	log.WithField("tx_hash", txHash.Hex()).Info("fulfillPrice broadcast")
 
 	s.wg.Add(1)
+	//nolint:gosec // G118 — watcher must outlive the inbound request context so in-flight txs aren't stranded
 	go func() {
 		defer s.wg.Done()
-		// Watcher uses a fresh context so a stream-receive cancellation doesn't
-		// strand in-flight txs — they finish under their own steam.
 		s.watch(context.Background(), sub, auth, aggregator, priceInt, tsBI, sigs)
 	}()
 	return nil
@@ -343,7 +341,7 @@ func (s *Submitter) watch(
 		receipt, err := s.chain.TxReceipt(ctx, sub.TxHash)
 		switch {
 		case err == nil:
-			s.finaliseFromReceipt(ctx, sub, receipt)
+			s.finalizeFromReceipt(ctx, sub, receipt)
 			if s.onGasUsed != nil {
 				s.onGasUsed(receipt.GasUsed)
 			}
@@ -393,7 +391,7 @@ func (s *Submitter) watch(
 	}
 }
 
-func (s *Submitter) finaliseFromReceipt(ctx context.Context, sub *models.Submission, r *types.Receipt) {
+func (s *Submitter) finalizeFromReceipt(ctx context.Context, sub *models.Submission, r *types.Receipt) {
 	switch r.Status {
 	case types.ReceiptStatusSuccessful:
 		sub.Status = models.SubmissionStatusConfirmed
@@ -402,7 +400,7 @@ func (s *Submitter) finaliseFromReceipt(ctx context.Context, sub *models.Submiss
 		sub.LastError = "tx reverted"
 	}
 	if err := s.repo.UpdateSubmission(ctx, sub); err != nil {
-		s.log.WithError(err).Warn("update submission on finalise")
+		s.log.WithError(err).Warn("update submission on finalize")
 	}
 	_ = s.repo.DeletePendingTx(ctx, sub.TxHash.Hex())
 	s.markSubmissionMetric(sub.AssetID, sub.Status)

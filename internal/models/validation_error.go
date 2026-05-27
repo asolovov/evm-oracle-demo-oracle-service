@@ -13,11 +13,3 @@ type ValidationError struct {
 func (e *ValidationError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Field, e.Message)
 }
-
-// newValidationError creates a new ValidationError.
-func newValidationError(field, message string) *ValidationError {
-	return &ValidationError{
-		Field:   field,
-		Message: message,
-	}
-}

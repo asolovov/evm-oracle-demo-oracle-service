@@ -320,7 +320,7 @@ func (r *PgxRepository) DeletePendingTx(ctx context.Context, txHash string) erro
 const getStreamCursorSQL = `SELECT last_acked_block FROM stream_cursor WHERE id = 1`
 
 // GetStreamCursor returns the last block the stream consumer successfully
-// acked. The row is initialised to (1, 0) by the init migration so this
+// acked. The row is initialized to (1, 0) by the init migration so this
 // never returns ErrNotFound.
 func (r *PgxRepository) GetStreamCursor(ctx context.Context) (uint64, error) {
 	var b int64
@@ -330,7 +330,6 @@ func (r *PgxRepository) GetStreamCursor(ctx context.Context) (uint64, error) {
 	if b < 0 {
 		b = 0
 	}
-	//nolint:gosec // block height fits uint64 by definition
 	return uint64(b), nil
 }
 
@@ -366,7 +365,6 @@ ON CONFLICT (asset_id) DO UPDATE
 
 // UpsertHeartbeat persists a single asset's heartbeat schedule.
 func (r *PgxRepository) UpsertHeartbeat(ctx context.Context, h models.HeartbeatSchedule) error {
-	//nolint:gosec // values come from RPC clamp+validate path
 	_, err := r.pool.Exec(ctx, upsertHeartbeatSQL,
 		h.AssetID,
 		int(h.Interval.Seconds()),

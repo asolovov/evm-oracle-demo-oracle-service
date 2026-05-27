@@ -51,7 +51,7 @@ func (s *Submission) ToProto() *oraclev1.SubmissionStatus {
 		SubmittedPrice: s.SubmittedPrice,
 		SubmittedAt:    ts,
 		Status:         s.Status.ToProto(),
-		RetryCount:     uint32(s.RetryCount),
+		RetryCount:     uint32(s.RetryCount), //nolint:gosec // bounded by SubmissionConfig.MaxRetries (≤ small int)
 		LastError:      s.LastError,
 	}
 }

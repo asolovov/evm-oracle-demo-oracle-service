@@ -94,8 +94,7 @@ func LoadFromConfig(cfg *config.SignerConfig, chainID uint64) (*Signer, error) {
 	return &Signer{
 		reporters: reps,
 		threshold: cfg.Threshold,
-		//nolint:gosec // chain id from config; uint64 -> *big.Int is safe
-		chainID: new(big.Int).SetUint64(chainID),
+		chainID:   new(big.Int).SetUint64(chainID),
 	}, nil
 }
 
@@ -171,11 +170,11 @@ func (s *Signer) BuildDigest(
 }
 
 // Sign produces one signature per loaded reporter over the supplied digest.
-// Signatures are 65 bytes (r || s || v) with v normalised to {27, 28} to
+// Signatures are 65 bytes (r || s || v) with v normalized to {27, 28} to
 // match OpenZeppelin's ECDSA.recover expectation.
 //
 // Caller decides quorum: pass all signatures to fulfillPrice; the on-chain
-// verifier counts distinct authorised signers and requires >= threshold.
+// verifier counts distinct authorized signers and requires >= threshold.
 func (s *Signer) Sign(digest []byte) ([][]byte, error) {
 	if len(digest) != 32 {
 		return nil, fmt.Errorf("digest must be 32 bytes, got %d", len(digest))
@@ -215,7 +214,7 @@ func loadReporter(path string, allowInsecurePerms bool) (Reporter, error) {
 		}
 	}
 
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // path is operator-supplied via SignerConfig.ReporterKeyPaths
 	if err != nil {
 		return Reporter{}, fmt.Errorf("read: %w", err)
 	}

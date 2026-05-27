@@ -13,7 +13,7 @@ func TestNewApplication(t *testing.T) {
 		t.Fatal("expected app, got nil")
 	}
 	if app.modules == nil {
-		t.Error("modules manager should be initialised")
+		t.Error("modules manager should be initialized")
 	}
 	if app.modules.Count() != 0 {
 		t.Errorf("expected 0 modules initially, got %d", app.modules.Count())

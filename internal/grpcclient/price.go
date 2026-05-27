@@ -29,7 +29,9 @@ type PriceClient struct {
 }
 
 // DialPrice opens a connection to price-service. Caller owns Close().
-func DialPrice(ctx context.Context, cfg *config.PriceClientConfig) (*PriceClient, error) {
+// The ctx parameter is reserved for future use (e.g. a synchronous health
+// probe) — grpc.NewClient itself dials lazily.
+func DialPrice(_ context.Context, cfg *config.PriceClientConfig) (*PriceClient, error) {
 	if cfg == nil || cfg.Address == "" {
 		return nil, errors.New("price client config missing address")
 	}

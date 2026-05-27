@@ -21,7 +21,8 @@ type IndexerClient struct {
 }
 
 // DialIndexer opens a connection to indexer-service.
-func DialIndexer(ctx context.Context, cfg *config.IndexerClientConfig) (*IndexerClient, error) {
+// The ctx parameter is reserved for future use.
+func DialIndexer(_ context.Context, cfg *config.IndexerClientConfig) (*IndexerClient, error) {
 	if cfg == nil || cfg.Address == "" {
 		return nil, errors.New("indexer client config missing address")
 	}

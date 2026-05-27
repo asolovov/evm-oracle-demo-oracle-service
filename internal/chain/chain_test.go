@@ -16,7 +16,7 @@ func TestScaleBigInt(t *testing.T) {
 		{"+10%", 100, 1.1, 110},
 		{"+50%", 200, 1.5, 300},
 		{"big number +10%", 1_000_000_000, 1.1, 1_100_000_000},
-		// 1.21 = 1.1^2; we just verify the per-call behaviour here.
+		// 1.21 = 1.1^2; we just verify the per-call behavior here.
 		{"1.21x via callsite math", 100, 1.21, 121},
 	}
 	for _, tt := range cases {

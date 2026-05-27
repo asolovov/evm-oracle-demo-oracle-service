@@ -66,10 +66,9 @@ type App struct {
 	metrics         *metrics.Metrics
 
 	// Coordination.
-	grpcDone     chan error
-	healthzDone  chan error
-	startedOnce  sync.Once
-	stoppedOnce  sync.Once
+	grpcDone    chan error
+	healthzDone chan error
+	stoppedOnce sync.Once
 }
 
 // NewApplication creates an App with a zero config (filled by cmd/root via viper).
@@ -90,8 +89,6 @@ func NewApplication() (*App, error) {
 }
 
 // Init validates configuration and constructs every component.
-//
-//nolint:gocyclo // the wiring graph is intrinsically wide; decomposing would just scatter the order
 func (app *App) Init() error {
 	if err := app.cfg.Validate(); err != nil {
 		return fmt.Errorf("validate config: %w", err)
@@ -198,7 +195,7 @@ func (app *App) Init() error {
 		}
 	}
 
-	app.log.Info("application initialised")
+	app.log.Info("application initialized")
 	return nil
 }
 
@@ -338,7 +335,7 @@ func (app *App) Modules() *module.Manager { return app.modules }
 // load-bearing dependency is reachable.
 func (app *App) readiness(ctx context.Context) error {
 	if app.repo == nil {
-		return errors.New("repository not initialised")
+		return errors.New("repository not initialized")
 	}
 	if err := app.repo.Ping(ctx); err != nil {
 		return fmt.Errorf("db: %w", err)

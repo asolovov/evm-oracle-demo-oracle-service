@@ -111,7 +111,7 @@ func TestNewAssetIDFromSymbol(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	if a.Symbol != "weth" {
-		t.Fatalf("symbol normalised to %q, want %q", a.Symbol, "weth")
+		t.Fatalf("symbol normalized to %q, want %q", a.Symbol, "weth")
 	}
 	if a.OnChain.Hex() == "" {
 		t.Fatal("on-chain hash empty")

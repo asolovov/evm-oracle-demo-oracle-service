@@ -3,7 +3,7 @@
 //
 // Plain Go package (architecture rule 5 — chain client is an external-system
 // handler, not a template module). The Client struct holds one *ethclient.Client
-// dialled at startup; callers come from the submitter (tx broadcast) and the
+// dialed at startup; callers come from the submitter (tx broadcast) and the
 // heartbeat scheduler (latestRoundData read).
 package chain
 
@@ -26,7 +26,7 @@ import (
 // ErrTxNotMined is the well-known sentinel for WaitMined polling.
 var ErrTxNotMined = errors.New("tx not yet mined")
 
-// Client is a thin go-ethereum wrapper centred on the surface oracle-service
+// Client is a thin go-ethereum wrapper centered on the surface oracle-service
 // needs: fulfillPrice broadcasts, EIP-1559 gas pricing, latestRoundData reads.
 type Client struct {
 	eth     *ethclient.Client
@@ -161,7 +161,7 @@ func (c *Client) ReplaceFulfillment(
 	signatures [][]byte,
 	gas GasStrategy,
 ) (common.Hash, error) {
-	// Same wire shape as SubmitFulfillment; the difference is *behavioural*
+	// Same wire shape as SubmitFulfillment; the difference is *behavioral*
 	// (caller pre-pins auth.Nonce + bumps the gas strategy). Kept as a
 	// separate method so the submitter's intent reads cleanly.
 	return c.SubmitFulfillment(ctx, auth, aggregator, reqID, price, timestamp, signatures, gas)
