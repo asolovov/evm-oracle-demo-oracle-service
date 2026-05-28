@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -25,6 +26,30 @@ import (
 
 // ErrTxNotMined is the well-known sentinel for WaitMined polling.
 var ErrTxNotMined = errors.New("tx not yet mined")
+
+// IsRevertError reports whether err originated from an on-chain revert —
+// typically surfaced via eth_estimateGas or eth_call simulation before the
+// tx is ever broadcast, but the watcher's receipt-status=0 path also routes
+// reverts here for symmetry.
+//
+// These errors are PERMANENT. Re-broadcasting the same calldata cannot change
+// a deterministic contract revert, so callers (the submitter) treat them as
+// terminal failures: persist STATUS_FAILED and let the streamconsumer advance
+// its cursor past the event. The alternative — retrying — burns RPC quota
+// and fills logs without any chance of progress.
+//
+// We use a small substring match because go-ethereum returns the RPC error
+// verbatim (`execution reverted`, `execution reverted: reason ...`) without a
+// stable typed error wrapper, and decoded custom-error data requires
+// per-contract ABI plumbing that we don't need just to classify.
+func IsRevertError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "revert") ||
+		strings.Contains(msg, "invalid opcode")
+}
 
 // Client is a thin go-ethereum wrapper centered on the surface oracle-service
 // needs: fulfillPrice broadcasts, EIP-1559 gas pricing, latestRoundData reads.

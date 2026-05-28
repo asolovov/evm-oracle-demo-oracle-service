@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -184,7 +185,10 @@ func newHarness(t *testing.T, fc *fakeChain, fp *fakePrice, fr *fakeRepo) *Submi
 	}
 	conv := &config.ConversionConfig{OnChainDecimals: 8}
 	aggregators := map[string]string{"weth": aggHex}
-	return New(fc, fp, fs, fr, cfg, conv, aggregators,
+	assetIDs := map[common.Address]common.Hash{
+		common.HexToAddress(aggHex): common.HexToHash("0x0f8a193ff464434486c0daf7db2a895884365d2bc84ba47a68fcf89c1b14b5b8"),
+	}
+	return New(fc, fp, fs, fr, cfg, conv, aggregators, assetIDs,
 		WithPollInterval(50*time.Millisecond),
 	)
 }
@@ -261,23 +265,16 @@ func TestHandleEvent_UnknownAggregator_SkippedNotError(t *testing.T) {
 	}
 }
 
-// TestHandleEvent_BroadcastFailure_NoPersist verifies the retry-friendly
-// behavior introduced after the live-stack debugging session caught a
-// permanent-skip bug: when the broadcaster wallet is unfunded, every
-// PriceRequested event broadcast fails pre-broadcast in go-ethereum
-// ("insufficient funds for transfer"). The earlier implementation persisted
-// a FAILED row on this path; the streamconsumer's ExistsByReqID idempotency
-// check then permanently skipped the req_id, so even after the operator
-// funded the wallet the affected requests stayed un-fulfilled.
+// TestHandleEvent_TransientBroadcastFailure_NoPersist covers TRANSIENT
+// broadcast errors (insufficient funds, RPC unreachable, nonce race). These
+// can succeed later, so the submitter must NOT persist a FAILED row —
+// otherwise the streamconsumer's ExistsByReqID check would latch the req_id
+// as terminal and skip it forever, even after the operator fixes the
+// underlying issue (e.g. funds the broadcaster wallet).
 //
-// Fix: don't persist anything on broadcast errors. The consumer doesn't
-// advance its cursor (the error blocks advance), so the same event will
-// be redelivered on the next stream pass and we'll retry cleanly.
-//
-// Reverted-on-chain failures (the watcher's path, after a tx hash exists)
-// DO continue to persist FAILED — those are deterministic outcomes that
-// re-dispatch can't change.
-func TestHandleEvent_BroadcastFailure_NoPersist(t *testing.T) {
+// The error propagates so the consumer blocks cursor advance and the event
+// redelivers cleanly on the next stream pass.
+func TestHandleEvent_TransientBroadcastFailure_NoPersist(t *testing.T) {
 	fc := &fakeChain{
 		gas:       chain.GasStrategy{GasTipCap: big.NewInt(1), GasFeeCap: big.NewInt(2)},
 		nonce:     7,
@@ -288,17 +285,64 @@ func TestHandleEvent_BroadcastFailure_NoPersist(t *testing.T) {
 	sub := newHarness(t, fc, fp, fr)
 
 	if err := sub.HandleEvent(context.Background(), priceRequestedEvent(t, aggHex, "9")); err == nil {
-		t.Fatal("expected broadcast error to propagate")
+		t.Fatal("expected transient error to propagate so consumer can retry")
 	}
 	subs, upd, pIn, pDel := fr.snapshot()
 	if len(subs) != 0 {
-		t.Fatalf("expected NO submission row on broadcast failure (retry-friendly), got %v", subs)
+		t.Fatalf("expected NO submission row on transient failure, got %v", subs)
 	}
 	if len(upd) != 0 {
 		t.Fatalf("expected no updates, got %v", upd)
 	}
 	if pIn != 0 || pDel != 0 {
 		t.Fatalf("expected no pending tx churn, got in=%d del=%d", pIn, pDel)
+	}
+}
+
+// TestHandleEvent_PermanentRevert_PersistsAndAdvances covers a PERMANENT
+// broadcast error — eth_estimateGas / eth_call simulation returned
+// "execution reverted". The contract has deterministically rejected the
+// calldata; re-broadcasting the same payload cannot change the outcome.
+//
+// Submitter must:
+//  1. Persist a STATUS_FAILED row with the revert reason in LastError, so
+//     ListSubmissions surfaces the dead submission for operator triage.
+//  2. Return nil (NOT propagate) so the streamconsumer advances its cursor
+//     past the offending event. Anything else is a retry storm — the same
+//     event would redeliver every reconnect with no possibility of success.
+//
+// This is the bug the live demo session caught: pre-fix, PR #3's
+// blanket "all broadcast errors are transient" rule treated reverts as
+// transient and spun on req_id 3 forever after an assetId-case mismatch.
+func TestHandleEvent_PermanentRevert_PersistsAndAdvances(t *testing.T) {
+	fc := &fakeChain{
+		gas:       chain.GasStrategy{GasTipCap: big.NewInt(1), GasFeeCap: big.NewInt(2)},
+		nonce:     7,
+		submitErr: errors.New("fulfillPrice: execution reverted"),
+	}
+	fp := &fakePrice{out: goodPrice()}
+	fr := &fakeRepo{}
+	sub := newHarness(t, fc, fp, fr)
+
+	err := sub.HandleEvent(context.Background(), priceRequestedEvent(t, aggHex, "10"))
+	if err != nil {
+		t.Fatalf("expected nil (cursor must advance past a permanent revert), got %v", err)
+	}
+	subs, upd, pIn, pDel := fr.snapshot()
+	if len(subs) != 1 {
+		t.Fatalf("expected one FAILED row on permanent revert, got %v", subs)
+	}
+	if subs[0].Status != models.SubmissionStatusFailed {
+		t.Fatalf("expected status=failed, got %v", subs[0].Status)
+	}
+	if subs[0].LastError == "" || !strings.Contains(subs[0].LastError, "revert") {
+		t.Fatalf("expected revert reason in LastError, got %q", subs[0].LastError)
+	}
+	if len(upd) != 0 {
+		t.Fatalf("expected no updates (pure insert path), got %v", upd)
+	}
+	if pIn != 0 || pDel != 0 {
+		t.Fatalf("expected no pending tx churn on pre-broadcast revert, got in=%d del=%d", pIn, pDel)
 	}
 }
 
@@ -405,6 +449,7 @@ func TestNew_BuildsAddressLookups(t *testing.T) {
 			"WETH": "0x075be31662c2548c4e940d7e769c328a34dcb281",
 			"WBTC": "0xf8ad3a2505eece7ad276db038c7c56930bd436e4",
 		},
+		map[common.Address]common.Hash{}, // not exercised by this test
 	)
 	if _, ok := sub.AggregatorBySymbol("weth"); !ok {
 		t.Fatal("weth lookup failed")

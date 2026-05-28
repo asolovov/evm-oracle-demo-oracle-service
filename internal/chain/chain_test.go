@@ -1,9 +1,44 @@
 package chain
 
 import (
+	"errors"
+	"fmt"
 	"math/big"
 	"testing"
 )
+
+func TestIsRevertError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// Permanent — return TRUE so submitter persists FAILED + advances cursor.
+		{"go-ethereum sim revert", errors.New("execution reverted"), true},
+		{"wrapped sim revert", fmt.Errorf("fulfillPrice: %w", errors.New("execution reverted")), true},
+		{"reverted with reason", errors.New("execution reverted: NoRoundData"), true},
+		{"reverted past tense", errors.New("the transaction reverted"), true},
+		{"mixed case", errors.New("Execution REVERTED"), true},
+		{"invalid opcode (legacy revert proxy)", errors.New("invalid opcode: STOP"), true},
+
+		// Transient — return FALSE so submitter retries.
+		{"insufficient funds", errors.New("insufficient funds for transfer"), false},
+		{"connection refused", errors.New("dial tcp: connection refused"), false},
+		{"context deadline", errors.New("context deadline exceeded"), false},
+		{"nonce too low", errors.New("nonce too low"), false},
+
+		// Edge.
+		{"nil", nil, false},
+		{"empty string", errors.New(""), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := IsRevertError(c.err); got != c.want {
+				t.Fatalf("IsRevertError(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
 
 func TestScaleBigInt(t *testing.T) {
 	cases := []struct {
