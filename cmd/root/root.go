@@ -51,7 +51,7 @@ func initializeConfig(cmd *cobra.Command, cfg *config.Scheme) error {
 		return fmt.Errorf("bind flags: %w", err)
 	}
 
-	return viper.Unmarshal(cfg)
+	return viper.Unmarshal(cfg, config.DecodeOption())
 }
 
 // bindFlags binds flags to the command.
