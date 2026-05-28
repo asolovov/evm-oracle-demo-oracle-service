@@ -90,9 +90,11 @@ type Submitter struct {
 
 	// On-chain assetId per aggregator. Populated at startup by application.go
 	// from chain.AssetID(addr) — NOT re-derived from the symbol off-chain.
-	// The contract owns the canonical bytes32; the symbol case in our config
-	// has historically drifted (see commit 0aa…sha that introduced this map
-	// after a case-mismatch bug bricked fulfillPrice with InsufficientSignatures).
+	// The contract owns the canonical bytes32; off-chain re-derivation is
+	// fragile because the deploy script used a different symbol case than
+	// the price-service wire format (a live debug session caught the
+	// resulting digest mismatch as fulfillPrice -> InsufficientSignatures ->
+	// `execution reverted`).
 	assetIDByAggregator map[common.Address]common.Hash
 
 	log *logrus.Entry
