@@ -33,7 +33,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/asolovov/evm-oracle-demo-oracle-service/config"
-	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/chain"
+	chainpkg "github.com/asolovov/evm-oracle-demo-oracle-service/internal/chain"
 	indexerv1 "github.com/asolovov/evm-oracle-demo-oracle-service/internal/genproto/indexer/v1"
 	pricev1 "github.com/asolovov/evm-oracle-demo-oracle-service/internal/genproto/price/v1"
 	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/models"
@@ -42,14 +42,14 @@ import (
 // ChainClient is the chain-package surface the submitter depends on. Defined
 // as an interface so unit tests can sub a fake without a live RPC.
 type ChainClient interface {
-	SuggestGas(ctx context.Context, attempt int) (chain.GasStrategy, error)
+	SuggestGas(ctx context.Context, attempt int) (chainpkg.GasStrategy, error)
 	NonceAt(ctx context.Context, addr common.Address) (uint64, error)
 	SubmitFulfillment(ctx context.Context, auth *bind.TransactOpts,
 		aggregator common.Address, reqID, price, timestamp *big.Int,
-		signatures [][]byte, gas chain.GasStrategy) (common.Hash, error)
+		signatures [][]byte, gas chainpkg.GasStrategy) (common.Hash, error)
 	ReplaceFulfillment(ctx context.Context, auth *bind.TransactOpts,
 		aggregator common.Address, reqID, price, timestamp *big.Int,
-		signatures [][]byte, gas chain.GasStrategy) (common.Hash, error)
+		signatures [][]byte, gas chainpkg.GasStrategy) (common.Hash, error)
 	TxReceipt(ctx context.Context, hash common.Hash) (*types.Receipt, error)
 	LatestRoundData(ctx context.Context, aggregator common.Address) (*big.Int, *big.Int, error)
 }
@@ -88,6 +88,13 @@ type Submitter struct {
 	bySymbol  map[string]common.Address
 	byAddress map[common.Address]string
 
+	// On-chain assetId per aggregator. Populated at startup by application.go
+	// from chain.AssetID(addr) — NOT re-derived from the symbol off-chain.
+	// The contract owns the canonical bytes32; the symbol case in our config
+	// has historically drifted (see commit 0aa…sha that introduced this map
+	// after a case-mismatch bug bricked fulfillPrice with InsufficientSignatures).
+	assetIDByAggregator map[common.Address]common.Hash
+
 	log *logrus.Entry
 
 	wg sync.WaitGroup
@@ -123,10 +130,18 @@ func WithPollInterval(d time.Duration) Option {
 }
 
 // New constructs a Submitter from its dependencies + the chain aggregator
-// table from config.
+// table from config + the on-chain assetId map from application startup.
+//
+// assetIDByAggregator MUST contain an entry for every address in
+// aggregatorAddresses (application.go enforces this by failing Init() if
+// the chain.AssetID() lookup errored for any aggregator). The map carries
+// the authoritative bytes32 used in the EIP-712 digest; without it the
+// submitter cannot produce signatures the contract's ReporterSet accepts.
 func New(c ChainClient, p PriceClient, sgn SignerClient, repo Repo,
 	cfg *config.SubmissionConfig, conv *config.ConversionConfig,
-	aggregatorAddresses map[string]string, opts ...Option,
+	aggregatorAddresses map[string]string,
+	assetIDByAggregator map[common.Address]common.Hash,
+	opts ...Option,
 ) *Submitter {
 	bySym := make(map[string]common.Address, len(aggregatorAddresses))
 	byAddr := make(map[common.Address]string, len(aggregatorAddresses))
@@ -141,8 +156,9 @@ func New(c ChainClient, p PriceClient, sgn SignerClient, repo Repo,
 		chain: c, price: p, signer: sgn, repo: repo,
 		cfg: cfg, conv: conv,
 		bySymbol: bySym, byAddress: byAddr,
-		pollEvery: 5 * time.Second,
-		log:       logrus.NewEntry(logrus.StandardLogger()).WithField("component", "submitter"),
+		assetIDByAggregator: assetIDByAggregator,
+		pollEvery:           5 * time.Second,
+		log:                 logrus.NewEntry(logrus.StandardLogger()).WithField("component", "submitter"),
 	}
 	for _, opt := range opts {
 		opt(sub)
@@ -223,9 +239,12 @@ func (s *Submitter) submit(ctx context.Context, symbol string, aggregator common
 		return fmt.Errorf("convert price to int256: %w", err)
 	}
 
-	assetID, err := models.NewAssetIDFromSymbol(symbol)
-	if err != nil {
-		return fmt.Errorf("derive on-chain asset id: %w", err)
+	assetID, ok := s.assetIDByAggregator[aggregator]
+	if !ok {
+		// Should never happen — application.go pre-loads the map for every
+		// configured aggregator and fails Init() on missing entries. Guard
+		// anyway so a future wiring regression surfaces loudly.
+		return fmt.Errorf("missing on-chain assetId for aggregator %s", aggregator.Hex())
 	}
 
 	ts := time.Now().UTC()
@@ -234,7 +253,7 @@ func (s *Submitter) submit(ctx context.Context, symbol string, aggregator common
 	}
 	tsBI := big.NewInt(ts.Unix())
 
-	digest, err := s.signer.BuildDigest(reqID, assetID.OnChain, priceInt, tsBI, aggregator)
+	digest, err := s.signer.BuildDigest(reqID, assetID, priceInt, tsBI, aggregator)
 	if err != nil {
 		return fmt.Errorf("build digest: %w", err)
 	}
@@ -261,20 +280,46 @@ func (s *Submitter) submit(ctx context.Context, symbol string, aggregator common
 
 	txHash, err := s.chain.SubmitFulfillment(ctx, auth, aggregator, reqID, priceInt, tsBI, sigs, gas)
 	if err != nil {
-		// Broadcast-time failures (insufficient funds, RPC unreachable, nonce
-		// race) are typically TRANSIENT — they don't represent a permanent
-		// on-chain decision. Don't persist a FAILED row here; if we did, the
-		// streamconsumer's ExistsByReqID idempotency check would latch this
-		// req_id as terminal and skip it forever, even after the operator
-		// fixes the underlying problem (e.g. funds the broadcaster wallet).
+		// Two distinct failure classes need different handling here.
 		//
-		// Surfacing the error to the consumer also blocks cursor advance,
-		// so the same event will be redelivered on the next stream pass
-		// and we'll retry with no state to clean up.
+		// TRANSIENT (insufficient funds, RPC unreachable, nonce race): the
+		// world may change and the same calldata could succeed later. Don't
+		// persist anything — if we did, the streamconsumer's ExistsByReqID
+		// idempotency check would latch this req_id as terminal and skip it
+		// forever. Propagate the error so the consumer blocks cursor advance
+		// and the event redelivers on the next stream pass.
 		//
-		// Reverted-on-chain failures (the watcher's path, after a tx hash
-		// exists) DO persist FAILED — those are deterministic outcomes the
-		// re-dispatch can't change.
+		// PERMANENT (eth_estimateGas / eth_call sim returned `execution
+		// reverted`): the calldata is deterministically rejected by the
+		// contract — for example a digest the ReporterSet refuses, a stale
+		// timestamp, or a req_id that was already fulfilled. Re-broadcasting
+		// the same calldata cannot change this. Persist STATUS_FAILED with
+		// the revert reason so operators see the dead submission in
+		// ListSubmissions, then return nil so the streamconsumer advances
+		// its cursor past the event and stops retrying.
+		//
+		// On-chain reverts AFTER broadcast (the watcher's receipt-status=0
+		// path) take a separate route — see finaliseFromReceipt below.
+		if chainpkg.IsRevertError(err) {
+			failed := &models.Submission{
+				ReqID:          reqID.String(),
+				AssetID:        symbol,
+				Aggregator:     aggregator,
+				SubmittedPrice: priceInt.String(),
+				SubmittedAt:    time.Now().UTC(),
+				Status:         models.SubmissionStatusFailed,
+				LastError:      err.Error(),
+			}
+			if _, insErr := s.repo.InsertSubmission(ctx, failed); insErr != nil {
+				log.WithError(insErr).Error("persist FAILED row after permanent revert")
+				// Fall through and propagate the original error so the consumer
+				// retries; better than silently losing the record.
+				return fmt.Errorf("broadcast fulfillPrice (permanent): %w", err)
+			}
+			s.markSubmissionMetric(symbol, models.SubmissionStatusFailed)
+			log.WithError(err).Error("broadcast fulfillPrice reverted; persisted FAILED, advancing past event")
+			return nil
+		}
 		log.WithError(err).Error("broadcast fulfillPrice failed; not persisting (transient — will retry on next stream pass)")
 		return fmt.Errorf("broadcast fulfillPrice: %w", err)
 	}
@@ -348,7 +393,7 @@ func (s *Submitter) watch(
 				s.onGasUsed(receipt.GasUsed)
 			}
 			return
-		case errors.Is(err, chain.ErrTxNotMined):
+		case errors.Is(err, chainpkg.ErrTxNotMined):
 			// expected pre-mine state
 		default:
 			log.WithError(err).Warn("receipt poll error (will retry)")

@@ -8,10 +8,13 @@ import (
 	"math/big"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/sirupsen/logrus"
 
 	"github.com/asolovov/evm-oracle-demo-oracle-service/config"
@@ -140,11 +143,24 @@ func (app *App) Init() error {
 	}
 	app.indexerClient = ic
 
-	// 6. Submitter (depends on signer + chain + price + repo).
+	// 6. On-chain assetId lookup. The deployed PriceAggregator stores the
+	// canonical bytes32 we must use in the EIP-712 digest; re-deriving via
+	// keccak256(symbol) off-chain is fragile (the original deploy used
+	// uppercase symbols, the price-service wire uses lowercase, and the two
+	// don't match). Fail-fast if any configured aggregator can't be reached
+	// or if the on-chain assetId doesn't correspond to ANY case-variant of
+	// the operator-supplied symbol — that almost certainly means the wrong
+	// aggregator was wired to the wrong symbol.
+	assetIDs, err := resolveAssetIDs(ctx, cc, app.cfg.Chain.AggregatorAddresses, app.log)
+	if err != nil {
+		return fmt.Errorf("resolve on-chain assetIds: %w", err)
+	}
+
+	// 7. Submitter (depends on signer + chain + price + repo + assetIDs).
 	sub := submitter.New(
 		cc, pc, sgn, repo,
 		&app.cfg.Submission, &app.cfg.Conversion,
-		app.cfg.Chain.AggregatorAddresses,
+		app.cfg.Chain.AggregatorAddresses, assetIDs,
 		submitter.WithLogger(app.log.WithField("component", "submitter")),
 		submitter.WithMetricsHooks(
 			func(asset, st string) { app.metrics.SubmissionsTotal.WithLabelValues(asset, st).Inc() },
@@ -341,6 +357,64 @@ func (app *App) Version() string { return app.version.String() }
 // module; other components are wired directly in application.go since they
 // lifecycle as Init+goroutine rather than the Init/Start/Stop module shape.
 func (app *App) Modules() *module.Manager { return app.modules }
+
+// resolveAssetIDs reads the on-chain `assetId()` from every configured
+// PriceAggregator and verifies it matches `keccak256(symbol)` for either
+// case-variant of the operator-supplied symbol (uppercase or lowercase).
+//
+// Why this exists: the EIP-712 digest the contract verifies uses the on-chain
+// assetId as its `bytes32 assetId` field. Re-deriving the bytes32 off-chain
+// from a symbol string is fragile — the original deploy used uppercase
+// (keccak256("WETH")) while the price-service wire format uses lowercase
+// ("weth"). A live test caught the case mismatch as
+// `fulfillPrice: execution reverted` (InsufficientSignatures, since the
+// digest the contract recomputes from its own assetId never matches what
+// the off-chain signer produced).
+//
+// Returning the on-chain values + verifying the symbol mapping catches typos
+// (wrong aggregator wired to a symbol) at startup instead of at first event.
+func resolveAssetIDs(
+	ctx context.Context,
+	cc *chain.Client,
+	aggregatorAddresses map[string]string,
+	log *logrus.Entry,
+) (map[common.Address]common.Hash, error) {
+	out := make(map[common.Address]common.Hash, len(aggregatorAddresses))
+
+	for sym, addrHex := range aggregatorAddresses {
+		addr := common.HexToAddress(addrHex)
+		onchain, err := cc.AssetID(ctx, addr)
+		if err != nil {
+			return nil, fmt.Errorf("aggregator %s (%s): assetId(): %w", sym, addr.Hex(), err)
+		}
+
+		upper := crypto.Keccak256Hash([]byte(strings.ToUpper(sym)))
+		lower := crypto.Keccak256Hash([]byte(strings.ToLower(sym)))
+
+		var matched string
+		switch onchain {
+		case upper:
+			matched = "uppercase"
+		case lower:
+			matched = "lowercase"
+		default:
+			return nil, fmt.Errorf(
+				"aggregator %s (%s): on-chain assetId %s matches neither keccak256(%q)=%s nor keccak256(%q)=%s — wrong aggregator for symbol?",
+				sym, addr.Hex(), onchain.Hex(),
+				strings.ToUpper(sym), upper.Hex(),
+				strings.ToLower(sym), lower.Hex(),
+			)
+		}
+		out[addr] = onchain
+		log.WithFields(logrus.Fields{
+			"symbol":     sym,
+			"aggregator": addr.Hex(),
+			"asset_id":   onchain.Hex(),
+			"derived":    matched,
+		}).Info("resolved on-chain assetId")
+	}
+	return out, nil
+}
 
 // readiness is the closure healthz exposes on /readyz. Returns nil iff every
 // load-bearing dependency reports healthy. Walks every registered module via
