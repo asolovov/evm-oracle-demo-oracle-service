@@ -261,11 +261,27 @@ func TestHandleEvent_UnknownAggregator_SkippedNotError(t *testing.T) {
 	}
 }
 
-func TestHandleEvent_BroadcastFailure_PersistsFailedRow(t *testing.T) {
+// TestHandleEvent_BroadcastFailure_NoPersist verifies the retry-friendly
+// behavior introduced after the live-stack debugging session caught a
+// permanent-skip bug: when the broadcaster wallet is unfunded, every
+// PriceRequested event broadcast fails pre-broadcast in go-ethereum
+// ("insufficient funds for transfer"). The earlier implementation persisted
+// a FAILED row on this path; the streamconsumer's ExistsByReqID idempotency
+// check then permanently skipped the req_id, so even after the operator
+// funded the wallet the affected requests stayed un-fulfilled.
+//
+// Fix: don't persist anything on broadcast errors. The consumer doesn't
+// advance its cursor (the error blocks advance), so the same event will
+// be redelivered on the next stream pass and we'll retry cleanly.
+//
+// Reverted-on-chain failures (the watcher's path, after a tx hash exists)
+// DO continue to persist FAILED — those are deterministic outcomes that
+// re-dispatch can't change.
+func TestHandleEvent_BroadcastFailure_NoPersist(t *testing.T) {
 	fc := &fakeChain{
 		gas:       chain.GasStrategy{GasTipCap: big.NewInt(1), GasFeeCap: big.NewInt(2)},
 		nonce:     7,
-		submitErr: errors.New("rpc down"),
+		submitErr: errors.New("insufficient funds for transfer"),
 	}
 	fp := &fakePrice{out: goodPrice()}
 	fr := &fakeRepo{}
@@ -274,12 +290,15 @@ func TestHandleEvent_BroadcastFailure_PersistsFailedRow(t *testing.T) {
 	if err := sub.HandleEvent(context.Background(), priceRequestedEvent(t, aggHex, "9")); err == nil {
 		t.Fatal("expected broadcast error to propagate")
 	}
-	subs, _, _, _ := fr.snapshot()
-	if len(subs) != 1 || subs[0].Status != models.SubmissionStatusFailed {
-		t.Fatalf("expected one failed insert, got %v", subs)
+	subs, upd, pIn, pDel := fr.snapshot()
+	if len(subs) != 0 {
+		t.Fatalf("expected NO submission row on broadcast failure (retry-friendly), got %v", subs)
 	}
-	if subs[0].LastError == "" {
-		t.Fatal("expected LastError populated on failure")
+	if len(upd) != 0 {
+		t.Fatalf("expected no updates, got %v", upd)
+	}
+	if pIn != 0 || pDel != 0 {
+		t.Fatalf("expected no pending tx churn, got in=%d del=%d", pIn, pDel)
 	}
 }
 
