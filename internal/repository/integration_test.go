@@ -137,13 +137,26 @@ func TestIntegration_InsertAndQuerySubmission(t *testing.T) {
 		t.Fatalf("by tx_hash returned %v", gotTx)
 	}
 
-	exists, err := repo.ExistsByReqID(ctx, "42")
+	weth := common.HexToAddress("0x075be31662c2548c4e940d7e769c328a34dcb281")
+	wbtc := common.HexToAddress("0xf8ad3a2505eece7ad276db038c7c56930bd436e4")
+
+	// Inserted aggregator (WETH) — should report exists.
+	exists, err := repo.ExistsForAggregatorReqID(ctx, weth, "42")
 	if err != nil || !exists {
-		t.Fatalf("expected exists=true; %v %v", exists, err)
+		t.Fatalf("expected exists=true for (WETH, 42); %v %v", exists, err)
 	}
-	missing, err := repo.ExistsByReqID(ctx, "9999")
+	// Same req_id but DIFFERENT aggregator — must NOT collide.
+	// This is the regression-guard for the per-aggregator scope bug
+	// (live run revealed the original ExistsByReqID returned true here,
+	// causing all sibling assets' events to be silently dropped).
+	wrongAgg, err := repo.ExistsForAggregatorReqID(ctx, wbtc, "42")
+	if err != nil || wrongAgg {
+		t.Fatalf("expected per-aggregator scope: WBTC/42 must be exists=false; got %v %v", wrongAgg, err)
+	}
+	// Unknown req_id on the known aggregator — also false.
+	missing, err := repo.ExistsForAggregatorReqID(ctx, weth, "9999")
 	if err != nil || missing {
-		t.Fatalf("expected exists=false; %v %v", missing, err)
+		t.Fatalf("expected exists=false for (WETH, 9999); %v %v", missing, err)
 	}
 }
 

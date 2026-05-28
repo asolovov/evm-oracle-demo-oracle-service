@@ -52,6 +52,7 @@ type ChainClient interface {
 		signatures [][]byte, gas chainpkg.GasStrategy) (common.Hash, error)
 	TxReceipt(ctx context.Context, hash common.Hash) (*types.Receipt, error)
 	LatestRoundData(ctx context.Context, aggregator common.Address) (*big.Int, *big.Int, error)
+	LatestStartedAt(ctx context.Context, aggregator common.Address) (*big.Int, error)
 }
 
 // PriceClient is the price-service gRPC surface.
@@ -249,11 +250,36 @@ func (s *Submitter) submit(ctx context.Context, symbol string, aggregator common
 		return fmt.Errorf("missing on-chain assetId for aggregator %s", aggregator.Hex())
 	}
 
+	// Compute the on-chain timestamp the contract will see in StaleTimestamp's
+	// monotonic guard. Two constraints stack:
+	//
+	//   1. Prefer the price's `aggregated_at` so consumers can reason about
+	//      observation freshness from the on-chain `startedAt` value.
+	//   2. Strictly greater than the previous round's `latestStartedAt`,
+	//      otherwise the contract reverts with StaleTimestamp(submittedAt,
+	//      latestStartedAt). Price-service's `aggregated_at` can legitimately
+	//      repeat (cached aggregations when nothing changed) — without the
+	//      floor below, two close-in-time submissions for the same asset
+	//      brick on chain.
 	ts := time.Now().UTC()
 	if msgTs := priceMsg.GetAggregatedAt(); msgTs != nil {
 		ts = msgTs.AsTime()
 	}
 	tsBI := big.NewInt(ts.Unix())
+
+	latestStartedAt, err := s.chain.LatestStartedAt(ctx, aggregator)
+	if err != nil {
+		return fmt.Errorf("read latestStartedAt: %w", err)
+	}
+	floor := new(big.Int).Add(latestStartedAt, big.NewInt(1))
+	if tsBI.Cmp(floor) < 0 {
+		log.WithFields(logrus.Fields{
+			"price_aggregated_at": tsBI.String(),
+			"latest_started_at":   latestStartedAt.String(),
+			"clamped_to":          floor.String(),
+		}).Debug("clamping submittedAt above latestStartedAt to satisfy monotonic guard")
+		tsBI = floor
+	}
 
 	digest, err := s.signer.BuildDigest(reqID, assetID, priceInt, tsBI, aggregator)
 	if err != nil {

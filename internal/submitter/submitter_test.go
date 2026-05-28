@@ -80,6 +80,16 @@ type fakeChain struct {
 	receiptCalls  int32
 
 	replaceCalls int32
+
+	// latestStartedAt is what the chain client will return for the
+	// monotonic-timestamp floor. Zero by default (fresh aggregator,
+	// any positive timestamp passes the StaleTimestamp guard).
+	latestStartedAt *big.Int
+
+	// timestampSpy, when non-nil, is invoked with the on-chain timestamp
+	// the submitter passes into SubmitFulfillment. Used to assert the
+	// clamp logic.
+	timestampSpy func(*big.Int)
 }
 
 type receiptStep struct {
@@ -94,7 +104,10 @@ func (c *fakeChain) NonceAt(_ context.Context, _ common.Address) (uint64, error)
 	return c.nonce, c.nonceErr
 }
 func (c *fakeChain) SubmitFulfillment(_ context.Context, _ *bind.TransactOpts,
-	_ common.Address, _, _, _ *big.Int, _ [][]byte, _ chain.GasStrategy) (common.Hash, error) {
+	_ common.Address, _, _, timestamp *big.Int, _ [][]byte, _ chain.GasStrategy) (common.Hash, error) {
+	if c.timestampSpy != nil {
+		c.timestampSpy(timestamp)
+	}
 	return c.submitTx, c.submitErr
 }
 func (c *fakeChain) ReplaceFulfillment(_ context.Context, _ *bind.TransactOpts,
@@ -114,6 +127,12 @@ func (c *fakeChain) TxReceipt(_ context.Context, _ common.Hash) (*types.Receipt,
 }
 func (c *fakeChain) LatestRoundData(_ context.Context, _ common.Address) (*big.Int, *big.Int, error) {
 	return big.NewInt(0), big.NewInt(0), nil
+}
+func (c *fakeChain) LatestStartedAt(_ context.Context, _ common.Address) (*big.Int, error) {
+	if c.latestStartedAt == nil {
+		return big.NewInt(0), nil
+	}
+	return new(big.Int).Set(c.latestStartedAt), nil
 }
 
 type fakeRepo struct {
@@ -343,6 +362,90 @@ func TestHandleEvent_PermanentRevert_PersistsAndAdvances(t *testing.T) {
 	}
 	if pIn != 0 || pDel != 0 {
 		t.Fatalf("expected no pending tx churn on pre-broadcast revert, got in=%d del=%d", pIn, pDel)
+	}
+}
+
+// TestSubmit_ClampsTimestampAboveLatestStartedAt covers the StaleTimestamp
+// bug caught live: price-service can serve a cached `aggregated_at` that's
+// <= the previous round's on-chain `latestStartedAt`, and the contract
+// rejects with StaleTimestamp on every second-and-subsequent submission for
+// the same asset.
+//
+// Fix: submitter reads latestStartedAt before signing and clamps the
+// on-chain timestamp to (latestStartedAt + 1) when the price's aggregation
+// timestamp is too old.
+func TestSubmit_ClampsTimestampAboveLatestStartedAt(t *testing.T) {
+	fc := &fakeChain{
+		gas:             chain.GasStrategy{GasTipCap: big.NewInt(1), GasFeeCap: big.NewInt(2)},
+		nonce:           7,
+		submitTx:        common.HexToHash("0xaa"),
+		latestStartedAt: big.NewInt(1779972121),
+		receiptByCall: []receiptStep{
+			{r: &types.Receipt{Status: types.ReceiptStatusSuccessful, GasUsed: 100000}, err: nil},
+		},
+	}
+	// Price-service returns an aggregated_at == latestStartedAt — the exact
+	// scenario the live revert reproduced (StaleTimestamp(1779972121, 1779972121)).
+	stalePrice := &pricev1.AggregatedPrice{
+		AssetId:      "weth",
+		MedianPrice:  3450.20,
+		AggregatedAt: timestamppb.New(time.Unix(1779972121, 0)),
+	}
+	fp := &fakePrice{out: stalePrice}
+	fr := &fakeRepo{}
+
+	// Capture what timestamp the chain client sees.
+	var seenTs *big.Int
+	fc.timestampSpy = func(ts *big.Int) { seenTs = new(big.Int).Set(ts) }
+
+	sub := newHarness(t, fc, fp, fr)
+
+	if err := sub.HandleEvent(context.Background(), priceRequestedEvent(t, aggHex, "5")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	sub.Wait()
+
+	if seenTs == nil {
+		t.Fatal("chain client never saw a timestamp — submission path didn't run")
+	}
+	want := big.NewInt(1779972122) // latestStartedAt + 1
+	if seenTs.Cmp(want) != 0 {
+		t.Fatalf("submittedAt was not clamped; got %s want %s", seenTs.String(), want.String())
+	}
+}
+
+// TestSubmit_KeepsFreshTimestampWhenAboveFloor verifies the clamp is a floor,
+// not a replacement — when the price's aggregation timestamp is already
+// strictly above latestStartedAt, the submitter preserves it (so consumers
+// can still reason about the price's observation freshness).
+func TestSubmit_KeepsFreshTimestampWhenAboveFloor(t *testing.T) {
+	freshAggAt := int64(1779972200) // 79s past latestStartedAt
+	fc := &fakeChain{
+		gas:             chain.GasStrategy{GasTipCap: big.NewInt(1), GasFeeCap: big.NewInt(2)},
+		nonce:           7,
+		submitTx:        common.HexToHash("0xaa"),
+		latestStartedAt: big.NewInt(1779972121),
+		receiptByCall: []receiptStep{
+			{r: &types.Receipt{Status: types.ReceiptStatusSuccessful, GasUsed: 100000}, err: nil},
+		},
+	}
+	fp := &fakePrice{out: &pricev1.AggregatedPrice{
+		AssetId:      "weth",
+		MedianPrice:  3450.20,
+		AggregatedAt: timestamppb.New(time.Unix(freshAggAt, 0)),
+	}}
+	var seenTs *big.Int
+	fc.timestampSpy = func(ts *big.Int) { seenTs = new(big.Int).Set(ts) }
+
+	sub := newHarness(t, fc, fp, &fakeRepo{})
+
+	if err := sub.HandleEvent(context.Background(), priceRequestedEvent(t, aggHex, "6")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	sub.Wait()
+
+	if seenTs == nil || seenTs.Int64() != freshAggAt {
+		t.Fatalf("expected fresh ts preserved; got %v want %d", seenTs, freshAggAt)
 	}
 }
 

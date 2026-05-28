@@ -32,7 +32,11 @@ type Repository interface {
 	GetSubmissionByReqID(ctx context.Context, reqID string) (*models.Submission, error)
 	GetSubmissionByTxHash(ctx context.Context, txHash string) (*models.Submission, error)
 	ListSubmissions(ctx context.Context, assetID string, limit, offset int) ([]*models.Submission, int, error)
-	ExistsByReqID(ctx context.Context, reqID string) (bool, error)
+	// ExistsForAggregatorReqID is the streamconsumer's idempotency check.
+	// MUST be scoped by (aggregator, req_id) — req_id is per-aggregator on
+	// chain, so two aggregators legitimately share the same req_id (every
+	// asset has its own counter starting at 1).
+	ExistsForAggregatorReqID(ctx context.Context, aggregator common.Address, reqID string) (bool, error)
 
 	// Pending tx tracking (restart resilience).
 	InsertPendingTx(ctx context.Context, submissionID int64, txHash string, nonce uint64, gasStrategyJSON []byte) error
@@ -246,19 +250,29 @@ func (r *PgxRepository) ListSubmissions(ctx context.Context, assetID string, lim
 	return out, total, nil
 }
 
-const existsByReqIDSQL = `
+const existsForAggregatorReqIDSQL = `
 SELECT EXISTS (
     SELECT 1 FROM oracle_submissions
-    WHERE  req_id = $1 AND req_id <> '0'
+    WHERE  req_id = $1
+      AND  aggregator = $2
+      AND  req_id <> '0'
 )`
 
-// ExistsByReqID is the idempotency check the stream consumer hits before
-// dispatching a delivered event. Heartbeat submissions (req_id == "0") are
-// excluded by definition.
-func (r *PgxRepository) ExistsByReqID(ctx context.Context, reqID string) (bool, error) {
+// ExistsForAggregatorReqID is the idempotency check the stream consumer
+// hits before dispatching a delivered event. Scoped by (aggregator, req_id)
+// because req_id is per-aggregator on chain — every asset's PriceAggregator
+// has its own counter, so the same req_id value coexists across all 10
+// assets. Scoping by req_id alone (as the original implementation did)
+// caused the second-and-subsequent asset's events to be silently skipped
+// after the first asset's row was persisted. See bugfix note #4 in
+// docs/SECURITY.md for the live-debug forensics.
+//
+// Heartbeat submissions (req_id == "0") are excluded by definition.
+func (r *PgxRepository) ExistsForAggregatorReqID(ctx context.Context, aggregator common.Address, reqID string) (bool, error) {
 	var exists bool
-	if err := r.pool.QueryRow(ctx, existsByReqIDSQL, reqID).Scan(&exists); err != nil {
-		return false, fmt.Errorf("exists by req_id: %w", err)
+	err := r.pool.QueryRow(ctx, existsForAggregatorReqIDSQL, reqID, aggregator.Hex()).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("exists by aggregator+req_id: %w", err)
 	}
 	return exists, nil
 }

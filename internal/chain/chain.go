@@ -207,6 +207,33 @@ func (c *Client) LatestRoundData(ctx context.Context, aggregator common.Address)
 	return r.Answer, r.UpdatedAt, nil
 }
 
+// LatestStartedAt returns `latestRoundData().startedAt` from the aggregator,
+// or 0 if the aggregator has no rounds yet (NoRoundData revert).
+//
+// The contract enforces a monotonic-startedAt invariant: every fulfillPrice
+// submission must carry `submittedAt > latestStartedAt`, else it reverts with
+// `StaleTimestamp(submittedAt, latestStartedAt)`. The submitter reads this
+// before signing so it can clamp its on-chain timestamp to satisfy the guard
+// — without that floor, two close-in-time submissions for the same asset can
+// both end up with the same `aggregated_at` from price-service (if the
+// upstream aggregation hasn't refreshed), and the second one bricks on chain.
+func (c *Client) LatestStartedAt(ctx context.Context, aggregator common.Address) (*big.Int, error) {
+	bound, err := priceaggregator.NewPriceAggregator(aggregator, c.eth)
+	if err != nil {
+		return nil, fmt.Errorf("bind aggregator: %w", err)
+	}
+	r, err := bound.LatestRoundData(&bind.CallOpts{Context: ctx})
+	if err != nil {
+		// `NoRoundData()` reverts when there's no previous round to read.
+		// Treat as zero so the caller's floor falls back to "anything > 0".
+		if IsRevertError(err) {
+			return new(big.Int), nil
+		}
+		return nil, fmt.Errorf("latest round data: %w", err)
+	}
+	return r.StartedAt, nil
+}
+
 // AssetID reads the bytes32 asset id off the aggregator. Used at startup so
 // the chain client can verify it has the right address for an asset and
 // reject typos at config time.
