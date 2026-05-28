@@ -3,6 +3,16 @@
 > **This is a portfolio demo. It is not a production oracle.** Read this whole
 > file before deploying anywhere that touches real funds.
 
+## Operational pre-requisite: fund the broadcaster wallet
+
+The chain client reuses **reporter\[0\]** (the first address in `SIGNER_REPORTER_KEY_PATHS`) as the broadcaster EOA for every `fulfillPrice` transaction. The on-chain contract does not gate `msg.sender` — the M-of-N digest signatures are the sole authorisation — so reusing one of the reporter keys for broadcast keeps the demo at three funded wallets instead of four.
+
+**Consequence: reporter\[0\] must hold gas-bearing native balance on the target chain at all times.** If it doesn't, every PriceRequested event hits go-ethereum's pre-broadcast funds check with `insufficient funds for transfer`, and the stream consumer logs a reconnect-retry loop until the wallet is topped up.
+
+Recommended floor on Sepolia: **≥ 0.1 ETH** (each `fulfillPrice` is ~150k gas; 0.1 ETH covers thousands of submissions at Sepolia base-fee). The `oracle_reporter_balance_eth{address}` Prometheus gauge is read once at startup — alert on it being below the floor.
+
+The other reporters (reporter\[1\], reporter\[2\]) only sign digests off-chain and do not need any balance.
+
 ## Threat model in scope
 
 The oracle-service custodies three EOA private keys whose signatures collectively authorise on-chain price submissions. The on-chain contract verifies M-of-N signatures over an EIP-712 digest; whoever holds M of the N keys can post any price they want, signed.
@@ -18,7 +28,7 @@ Concretely: if an attacker reads two of `reporter{1,2,3}.json` off disk, they ca
 | Key file permissions | Enforced fail-fast: `signer.LoadFromConfig` rejects anything more permissive than `0600` unless `SIGNER_ALLOW_INSECURE_PERMS=true`. That flag exists for local development only. | `SIGNER_ALLOW_INSECURE_PERMS` is never set in production. |
 | Image build | Distroless `nonroot`. Keys are NEVER baked into the image — they are mounted as a read-only volume at runtime. | Same shape, with the secret source pointing at the cluster's secret manager (Vault, AWS Secrets Manager, GCP Secret Manager). |
 | Network | Service binds gRPC on `0.0.0.0:9090`; expected to sit behind Caddy / nginx on the VPS, not exposed to the open internet. | mTLS + workload identity. The admin RPC (`SetHeartbeat`) needs a real auth layer, not just network isolation. |
-| Submission idempotency | Stream consumer checks `oracle_submissions.req_id` before dispatch. The indexer stream is at-least-once; the DB check makes oracle's reaction at-most-once. | Same shape. The integrity guarantee scales with how much you trust the indexer's confirmation gate. |
+| Submission idempotency | Stream consumer checks `oracle_submissions.req_id` before dispatch. The indexer stream is at-least-once; the DB check makes oracle's reaction at-most-once. Broadcast-time errors (insufficient funds, RPC unreachable) do NOT persist a FAILED row — they propagate up so the consumer reconnects and retries the same event after the operator fixes the underlying issue. On-chain reverts DO persist FAILED (deterministic outcome, retry can't change it). | Same shape. The integrity guarantee scales with how much you trust the indexer's confirmation gate. |
 | Replace-by-fee | Same nonce + gas bump on `SUBMISSION_REPLACE_AFTER_SEC` elapsed; max 3 retries then `STATUS_DROPPED`. | Tighter operator monitoring; alert on `oracle_submissions_total{status=\"dropped\"}` > 0. |
 
 ## What the on-chain contract checks (independent of this service)

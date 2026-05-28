@@ -261,19 +261,21 @@ func (s *Submitter) submit(ctx context.Context, symbol string, aggregator common
 
 	txHash, err := s.chain.SubmitFulfillment(ctx, auth, aggregator, reqID, priceInt, tsBI, sigs, gas)
 	if err != nil {
-		failed := &models.Submission{
-			ReqID:          reqID.String(),
-			AssetID:        symbol,
-			Aggregator:     aggregator,
-			SubmittedPrice: priceInt.String(),
-			SubmittedAt:    time.Now().UTC(),
-			Status:         models.SubmissionStatusFailed,
-			LastError:      err.Error(),
-		}
-		if _, insErr := s.repo.InsertSubmission(ctx, failed); insErr != nil {
-			log.WithError(insErr).Error("failed to persist failure row")
-		}
-		s.markSubmissionMetric(symbol, models.SubmissionStatusFailed)
+		// Broadcast-time failures (insufficient funds, RPC unreachable, nonce
+		// race) are typically TRANSIENT — they don't represent a permanent
+		// on-chain decision. Don't persist a FAILED row here; if we did, the
+		// streamconsumer's ExistsByReqID idempotency check would latch this
+		// req_id as terminal and skip it forever, even after the operator
+		// fixes the underlying problem (e.g. funds the broadcaster wallet).
+		//
+		// Surfacing the error to the consumer also blocks cursor advance,
+		// so the same event will be redelivered on the next stream pass
+		// and we'll retry with no state to clean up.
+		//
+		// Reverted-on-chain failures (the watcher's path, after a tx hash
+		// exists) DO persist FAILED — those are deterministic outcomes the
+		// re-dispatch can't change.
+		log.WithError(err).Error("broadcast fulfillPrice failed; not persisting (transient — will retry on next stream pass)")
 		return fmt.Errorf("broadcast fulfillPrice: %w", err)
 	}
 

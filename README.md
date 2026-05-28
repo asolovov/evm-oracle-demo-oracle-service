@@ -45,6 +45,12 @@ make compose-up
 
 The binary lands at `./bin/evm-oracle-demo-oracle-service`.
 
+> ⚠️  **Fund reporter\[0\] before going live.** The chain client reuses the first
+> reporter key as the broadcaster EOA for every `fulfillPrice` tx. If reporter\[0\]
+> doesn't hold native gas balance, every event will loop in the stream consumer
+> with `insufficient funds for transfer`. See [`docs/SECURITY.md`](./docs/SECURITY.md#operational-pre-requisite-fund-the-broadcaster-wallet)
+> for the rationale + recommended floor.
+
 ## Configuration
 
 Every env var the service reads is registered with `viper.SetDefault` in `config/init.go` (rule 6), so a single `grep SetDefault config/` enumerates the full surface.
