@@ -41,6 +41,11 @@ func TestSubmissionStatus_ToProto(t *testing.T) {
 		{SubmissionStatusConfirmed, oraclev1.SubmissionStatus_STATUS_CONFIRMED},
 		{SubmissionStatusFailed, oraclev1.SubmissionStatus_STATUS_FAILED},
 		{SubmissionStatusDropped, oraclev1.SubmissionStatus_STATUS_DROPPED},
+		{SubmissionStatusExpired, oraclev1.SubmissionStatus_STATUS_EXPIRED},
+		// Internal-only pipeline statuses surface as PENDING on the wire.
+		{SubmissionStatusQueued, oraclev1.SubmissionStatus_STATUS_PENDING},
+		{SubmissionStatusProcessing, oraclev1.SubmissionStatus_STATUS_PENDING},
+		{SubmissionStatusSending, oraclev1.SubmissionStatus_STATUS_PENDING},
 		{SubmissionStatusUnknown, oraclev1.SubmissionStatus_STATUS_UNSPECIFIED},
 		{SubmissionStatus(99), oraclev1.SubmissionStatus_STATUS_UNSPECIFIED},
 	}
@@ -60,6 +65,7 @@ func TestSubmissionStatusFromProto(t *testing.T) {
 		{oraclev1.SubmissionStatus_STATUS_CONFIRMED, SubmissionStatusConfirmed},
 		{oraclev1.SubmissionStatus_STATUS_FAILED, SubmissionStatusFailed},
 		{oraclev1.SubmissionStatus_STATUS_DROPPED, SubmissionStatusDropped},
+		{oraclev1.SubmissionStatus_STATUS_EXPIRED, SubmissionStatusExpired},
 		{oraclev1.SubmissionStatus_STATUS_UNSPECIFIED, SubmissionStatusUnknown},
 	}
 	for _, c := range cases {

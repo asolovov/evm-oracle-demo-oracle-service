@@ -91,18 +91,19 @@ func ParseSubmissionStatus(s string) (SubmissionStatus, error) {
 // ToProto converts to the oracle.v1.SubmissionStatus_Status enum.
 //
 // The async-pipeline internal statuses (queued/processing/sending) have no
-// wire counterpart; external consumers see them as STATUS_PENDING ("in
-// flight"). `expired` maps to STATUS_FAILED until the protocols repo adds
-// STATUS_EXPIRED (task 06.1 prerequisite PR A) — swap to
-// oraclev1.SubmissionStatus_STATUS_EXPIRED once that lands + is regenerated.
+// distinct wire value; external consumers see them as STATUS_PENDING ("in
+// flight"). `expired` maps to its own STATUS_EXPIRED (added in protocols for
+// task 06.1) — distinct from STATUS_FAILED: nothing was broadcast on-chain.
 func (s SubmissionStatus) ToProto() oraclev1.SubmissionStatus_Status {
 	switch s {
 	case SubmissionStatusPending, SubmissionStatusQueued, SubmissionStatusProcessing, SubmissionStatusSending:
 		return oraclev1.SubmissionStatus_STATUS_PENDING
 	case SubmissionStatusConfirmed:
 		return oraclev1.SubmissionStatus_STATUS_CONFIRMED
-	case SubmissionStatusFailed, SubmissionStatusExpired:
+	case SubmissionStatusFailed:
 		return oraclev1.SubmissionStatus_STATUS_FAILED
+	case SubmissionStatusExpired:
+		return oraclev1.SubmissionStatus_STATUS_EXPIRED
 	case SubmissionStatusDropped:
 		return oraclev1.SubmissionStatus_STATUS_DROPPED
 	case SubmissionStatusUnknown:
@@ -123,6 +124,8 @@ func SubmissionStatusFromProto(p oraclev1.SubmissionStatus_Status) SubmissionSta
 		return SubmissionStatusFailed
 	case oraclev1.SubmissionStatus_STATUS_DROPPED:
 		return SubmissionStatusDropped
+	case oraclev1.SubmissionStatus_STATUS_EXPIRED:
+		return SubmissionStatusExpired
 	case oraclev1.SubmissionStatus_STATUS_UNSPECIFIED:
 		return SubmissionStatusUnknown
 	default:
