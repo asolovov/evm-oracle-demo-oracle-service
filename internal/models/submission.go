@@ -27,11 +27,15 @@ type Submission struct {
 	AssetID        string // canonical lowercase symbol ("weth", "xau", ...) or 0x-hex bytes32
 	Aggregator     common.Address
 	TxHash         common.Hash      // zero until first broadcast
-	SubmittedPrice string           // int256 in Chainlink 8-decimal scale, decimal string
+	SubmittedPrice string           // int256 in Chainlink 8-decimal scale, decimal string; empty until a worker prices it
 	SubmittedAt    time.Time
 	Status         SubmissionStatus
 	RetryCount     int
 	LastError      string
+
+	// ExpiresAt is the TTL deadline for a queued request (task 06.1). Zero for
+	// heartbeat submissions (which bypass the queue) and for terminal rows.
+	ExpiresAt time.Time
 }
 
 // ToProto produces the wire form for ListSubmissions / GetSubmissionStatus.

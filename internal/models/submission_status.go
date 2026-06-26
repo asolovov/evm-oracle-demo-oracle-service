@@ -23,6 +23,18 @@ const (
 	SubmissionStatusFailed
 	// SubmissionStatusDropped — fell out of the mempool after MaxRetries replacements.
 	SubmissionStatusDropped
+	// SubmissionStatusQueued — durably enqueued by the stream consumer, not yet
+	// claimed by a worker. Internal-only, no wire counterpart (task 06.1).
+	SubmissionStatusQueued
+	// SubmissionStatusProcessing — a worker is fetching the price + signing.
+	// Internal-only.
+	SubmissionStatusProcessing
+	// SubmissionStatusSending — signed and handed to the sender for broadcast.
+	// Internal-only.
+	SubmissionStatusSending
+	// SubmissionStatusExpired — abandoned before broadcast because it could not
+	// be fulfilled within its TTL (e.g. price never became available). Terminal.
+	SubmissionStatusExpired
 )
 
 // submissionStatusUnknownName is the canonical string for an unrecognized
@@ -32,11 +44,15 @@ const submissionStatusUnknownName = "unknown"
 
 // submissionStatusNames is the symmetric String/FromString lookup table.
 var submissionStatusNames = map[SubmissionStatus]string{
-	SubmissionStatusUnknown:   submissionStatusUnknownName,
-	SubmissionStatusPending:   "pending",
-	SubmissionStatusConfirmed: "confirmed",
-	SubmissionStatusFailed:    "failed",
-	SubmissionStatusDropped:   "dropped",
+	SubmissionStatusUnknown:    submissionStatusUnknownName,
+	SubmissionStatusPending:    "pending",
+	SubmissionStatusConfirmed:  "confirmed",
+	SubmissionStatusFailed:     "failed",
+	SubmissionStatusDropped:    "dropped",
+	SubmissionStatusQueued:     "queued",
+	SubmissionStatusProcessing: "processing",
+	SubmissionStatusSending:    "sending",
+	SubmissionStatusExpired:    "expired",
 }
 
 // submissionStatusValues is the reverse lookup.
@@ -73,13 +89,19 @@ func ParseSubmissionStatus(s string) (SubmissionStatus, error) {
 }
 
 // ToProto converts to the oracle.v1.SubmissionStatus_Status enum.
+//
+// The async-pipeline internal statuses (queued/processing/sending) have no
+// wire counterpart; external consumers see them as STATUS_PENDING ("in
+// flight"). `expired` maps to STATUS_FAILED until the protocols repo adds
+// STATUS_EXPIRED (task 06.1 prerequisite PR A) — swap to
+// oraclev1.SubmissionStatus_STATUS_EXPIRED once that lands + is regenerated.
 func (s SubmissionStatus) ToProto() oraclev1.SubmissionStatus_Status {
 	switch s {
-	case SubmissionStatusPending:
+	case SubmissionStatusPending, SubmissionStatusQueued, SubmissionStatusProcessing, SubmissionStatusSending:
 		return oraclev1.SubmissionStatus_STATUS_PENDING
 	case SubmissionStatusConfirmed:
 		return oraclev1.SubmissionStatus_STATUS_CONFIRMED
-	case SubmissionStatusFailed:
+	case SubmissionStatusFailed, SubmissionStatusExpired:
 		return oraclev1.SubmissionStatus_STATUS_FAILED
 	case SubmissionStatusDropped:
 		return oraclev1.SubmissionStatus_STATUS_DROPPED

@@ -85,12 +85,22 @@ type SignerConfig struct {
 	AllowInsecurePerms   bool     `mapstructure:"allow_insecure_perms"` // dev-only escape hatch; production must keep this false
 }
 
-// SubmissionConfig holds on-chain submission retry + gas settings.
+// SubmissionConfig holds on-chain submission retry + gas settings, plus the
+// async-pipeline knobs (task 06.1).
 type SubmissionConfig struct {
-	MaxRetries       int     `mapstructure:"max_retries"`
-	ReplaceAfterSec  int     `mapstructure:"replace_after_sec"`
-	GasMultiplier    float64 `mapstructure:"gas_multiplier"`
-	ConfirmTimeoutSec int    `mapstructure:"confirm_timeout_sec"`
+	MaxRetries        int     `mapstructure:"max_retries"`
+	ReplaceAfterSec   int     `mapstructure:"replace_after_sec"`
+	GasMultiplier     float64 `mapstructure:"gas_multiplier"`
+	ConfirmTimeoutSec int     `mapstructure:"confirm_timeout_sec"`
+
+	// Workers is the size of the async processing pool (price-fetch + sign).
+	// One stuck/un-priceable asset occupies at most one slot; the rest keep
+	// flowing — this is what prevents head-of-line blocking. (task 06.1)
+	Workers int `mapstructure:"workers"`
+	// RequestTTLSec bounds how long a queued request is retried before it is
+	// marked `expired` and abandoned. TTL applies only PRE-broadcast — once a
+	// request consumes a nonce it runs to a terminal tx state. (task 06.1)
+	RequestTTLSec int `mapstructure:"request_ttl_sec"`
 }
 
 // HeartbeatConfig holds per-asset heartbeat scheduler defaults.

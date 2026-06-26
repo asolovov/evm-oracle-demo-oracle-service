@@ -75,6 +75,7 @@ Sensible defaults:
 | `PRICE_ADDRESS` / `INDEXER_ADDRESS` | `price-service:9090` / `indexer-service:9090` |
 | `SIGNER_THRESHOLD` / `SIGNER_ALLOW_INSECURE_PERMS` | `2` / `false` |
 | `SUBMISSION_MAX_RETRIES` / `REPLACE_AFTER_SEC` / `GAS_MULTIPLIER` / `CONFIRM_TIMEOUT_SEC` | `3` / `60` / `1.1` / `300` |
+| `SUBMISSION_WORKERS` / `SUBMISSION_REQUEST_TTL_SEC` | `4` / `600` (async pool size / pre-broadcast request TTL) |
 | `HEARTBEAT_ENABLED` / `INTERVAL_SEC` / `DEVIATION_THRESHOLD` | `true` / `3600` / `0.015` |
 | `CONVERSION_ON_CHAIN_DECIMALS` | `8` (Chainlink scale) |
 

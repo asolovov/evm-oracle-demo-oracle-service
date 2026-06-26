@@ -75,6 +75,8 @@ func TestValidate_OKOnMinimalValidConfig(t *testing.T) {
 			MaxRetries:      3,
 			ReplaceAfterSec: 60,
 			GasMultiplier:   1.1,
+			Workers:         4,
+			RequestTTLSec:   600,
 		},
 		Conversion: ConversionConfig{OnChainDecimals: 8},
 		Heartbeat:  HeartbeatConfig{Enabled: true, IntervalSec: 3600, DeviationThreshold: 0.015},
