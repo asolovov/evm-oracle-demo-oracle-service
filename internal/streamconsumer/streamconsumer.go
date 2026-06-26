@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 
@@ -48,7 +49,10 @@ type Dispatcher interface {
 type CursorStore interface {
 	GetStreamCursor(ctx context.Context) (uint64, error)
 	AdvanceStreamCursor(ctx context.Context, block uint64) error
-	ExistsByReqID(ctx context.Context, reqID string) (bool, error)
+	// ExistsForAggregatorReqID is the idempotency check. MUST be scoped by
+	// (aggregator, req_id) — req_id is per-aggregator on chain. See
+	// repository.ExistsForAggregatorReqID for the full rationale.
+	ExistsForAggregatorReqID(ctx context.Context, aggregator common.Address, reqID string) (bool, error)
 }
 
 // StreamClient is the indexer.v1 client surface we use. Defined here so tests
@@ -254,13 +258,16 @@ func (c *Consumer) handleEvent(ctx context.Context, ev *indexerv1.Event) error {
 		return c.advance(ctx, ev.GetMeta().GetBlockNumber())
 	}
 
-	exists, err := c.store.ExistsByReqID(ctx, pr.GetReqId())
+	aggregator := common.HexToAddress(ev.GetMeta().GetContractAddress())
+	exists, err := c.store.ExistsForAggregatorReqID(ctx, aggregator, pr.GetReqId())
 	if err != nil {
 		return fmt.Errorf("idempotency check: %w", err)
 	}
 	if exists {
-		c.log.WithField("req_id", pr.GetReqId()).
-			Debug("submission already recorded; skipping")
+		c.log.WithFields(logrus.Fields{
+			"req_id":     pr.GetReqId(),
+			"aggregator": aggregator.Hex(),
+		}).Debug("submission already recorded; skipping")
 		return c.advance(ctx, ev.GetMeta().GetBlockNumber())
 	}
 

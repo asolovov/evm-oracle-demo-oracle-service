@@ -9,6 +9,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// labelAsset is the shared Prometheus label for the per-asset dimension.
+const labelAsset = "asset"
+
 // Metrics bundles every counter / gauge / histogram the service emits.
 type Metrics struct {
 	Registry *prometheus.Registry
@@ -22,6 +25,11 @@ type Metrics struct {
 	StreamReconnectTotal  prometheus.Counter
 	StreamLagSeconds      prometheus.Gauge
 	HeartbeatSkippedTotal *prometheus.CounterVec
+
+	// Async pipeline (task 06.1).
+	RequestsQueuedTotal       prometheus.Counter
+	RequestsExpiredTotal      *prometheus.CounterVec
+	RequestProcessingDuration prometheus.Histogram
 }
 
 // New constructs and registers every metric on a fresh registry.
@@ -33,12 +41,12 @@ func New() *Metrics {
 		SubmissionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "oracle_submissions_total",
 			Help: "Number of fulfillPrice submissions, keyed by asset and terminal status.",
-		}, []string{"asset", "status"}),
+		}, []string{labelAsset, "status"}),
 		SubmissionDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "oracle_submission_duration_seconds",
 			Help:    "Wall-clock seconds from submit() entry to terminal state.",
 			Buckets: prometheus.DefBuckets,
-		}, []string{"asset"}),
+		}, []string{labelAsset}),
 		SignatureSetTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "oracle_signature_set_total",
 			Help: "Number of signatures produced per reporter.",
@@ -68,6 +76,19 @@ func New() *Metrics {
 			Name: "oracle_heartbeat_skipped_total",
 			Help: "Heartbeat ticks that decided not to fire (within tolerance + within interval).",
 		}, []string{"symbol"}),
+		RequestsQueuedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "oracle_requests_queued_total",
+			Help: "Price requests durably enqueued by the stream consumer for async processing.",
+		}),
+		RequestsExpiredTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "oracle_requests_expired_total",
+			Help: "Requests abandoned pre-broadcast after exceeding their TTL, by asset.",
+		}, []string{labelAsset}),
+		RequestProcessingDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "oracle_request_processing_duration_seconds",
+			Help:    "Seconds from claim to hand-off to the sender (price fetch + sign).",
+			Buckets: prometheus.DefBuckets,
+		}),
 	}
 
 	reg.MustRegister(
@@ -80,6 +101,9 @@ func New() *Metrics {
 		m.StreamReconnectTotal,
 		m.StreamLagSeconds,
 		m.HeartbeatSkippedTotal,
+		m.RequestsQueuedTotal,
+		m.RequestsExpiredTotal,
+		m.RequestProcessingDuration,
 	)
 	return m
 }

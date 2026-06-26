@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -23,6 +24,8 @@ import (
 type fakeStore struct {
 	mu       sync.Mutex
 	cursor   uint64
+	// existing is keyed by (aggregator|reqID) so we can simulate the real
+	// per-aggregator idempotency scope.
 	existing map[string]bool
 	advances []uint64
 }
@@ -47,16 +50,20 @@ func (f *fakeStore) AdvanceStreamCursor(_ context.Context, block uint64) error {
 	return nil
 }
 
-func (f *fakeStore) ExistsByReqID(_ context.Context, reqID string) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.existing[reqID], nil
+func existsKey(addr common.Address, reqID string) string {
+	return addr.Hex() + "|" + reqID
 }
 
-func (f *fakeStore) markSeen(reqID string) {
+func (f *fakeStore) ExistsForAggregatorReqID(_ context.Context, addr common.Address, reqID string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.existing[reqID] = true
+	return f.existing[existsKey(addr, reqID)], nil
+}
+
+func (f *fakeStore) markSeen(addr common.Address, reqID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.existing[existsKey(addr, reqID)] = true
 }
 
 type recordingDispatcher struct {
@@ -125,11 +132,18 @@ func (s *scriptedStream) Recv() (*indexerv1.Event, error) {
 
 func (s *scriptedStream) Context() context.Context { return s.ctx }
 
+const defaultAgg = "0x000000000000000000000000000000000000aaaa"
+
 func priceRequestedEvent(block uint64, reqID string) *indexerv1.Event {
+	return priceRequestedEventFor(block, reqID, defaultAgg)
+}
+
+func priceRequestedEventFor(block uint64, reqID, aggregatorHex string) *indexerv1.Event {
 	return &indexerv1.Event{
 		Meta: &indexerv1.EventMeta{
-			BlockNumber: block,
-			ObservedAt:  timestamppb.Now(),
+			ContractAddress: aggregatorHex,
+			BlockNumber:     block,
+			ObservedAt:      timestamppb.Now(),
 		},
 		Kind: indexerv1.EventKind_EVENT_KIND_PRICE_REQUESTED,
 		Payload: &indexerv1.Event_PriceRequested{
@@ -193,7 +207,7 @@ func TestRunOnce_DispatchesAndAdvances(t *testing.T) {
 
 func TestRunOnce_SkipsAlreadyAcked(t *testing.T) {
 	store := newFakeStore(100)
-	store.markSeen("1") // pretend we already dispatched this one
+	store.markSeen(common.HexToAddress(defaultAgg), "1") // pretend we already dispatched this one
 	disp := &recordingDispatcher{}
 	client := &fakeStreamClient{sessions: []func() (*indexerv1.Event, error){
 		scriptEvents([]*indexerv1.Event{
@@ -210,6 +224,47 @@ func TestRunOnce_SkipsAlreadyAcked(t *testing.T) {
 	}
 	if store.cursor != 102 {
 		t.Fatalf("cursor advanced to %d, want 102 (advance still happens on skip)", store.cursor)
+	}
+}
+
+// TestRunOnce_PerAggregatorIdempotency covers the live-debug bug where the
+// streamconsumer's idempotency check skipped every aggregator's req_id=N
+// after the FIRST aggregator's req_id=N got persisted, because the check
+// was scoped by req_id alone instead of (aggregator, req_id).
+//
+// req_id is per-aggregator on chain — every PriceAggregator has its own
+// counter starting at 1. A multi-asset stress test (8 simultaneous
+// requestPrice calls during a live run) revealed that 7 of the 8 events
+// were silently dropped after WETH's req_id=3 confirmed first.
+func TestRunOnce_PerAggregatorIdempotency(t *testing.T) {
+	store := newFakeStore(100)
+	disp := &recordingDispatcher{}
+
+	wethAgg := "0x000000000000000000000000000000000000aaaa"
+	wbtcAgg := "0x000000000000000000000000000000000000bbbb"
+
+	// Pre-seed: WETH's req_id=3 already recorded as a previous successful
+	// submission. The consumer should still dispatch WBTC's req_id=3 since
+	// it's a different aggregator's counter.
+	store.markSeen(common.HexToAddress(wethAgg), "3")
+
+	client := &fakeStreamClient{sessions: []func() (*indexerv1.Event, error){
+		scriptEvents([]*indexerv1.Event{
+			priceRequestedEventFor(101, "3", wethAgg), // should SKIP — already seen
+			priceRequestedEventFor(102, "3", wbtcAgg), // should DISPATCH — different aggregator
+			priceRequestedEventFor(103, "3", wethAgg), // should SKIP — duplicate of seeded one
+		}, io.EOF),
+	}}
+	c := newConsumer(t, store, disp, client)
+
+	_ = c.runOnce(context.Background())
+
+	got := disp.snapshot()
+	if len(got) != 1 || got[0] != "3" {
+		t.Fatalf("expected exactly one dispatch (WBTC req_id=3), got %v", got)
+	}
+	if store.cursor != 103 {
+		t.Fatalf("cursor must advance past every event (skips advance too); got %d", store.cursor)
 	}
 }
 

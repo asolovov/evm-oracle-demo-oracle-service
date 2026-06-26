@@ -166,6 +166,11 @@ func (app *App) Init() error {
 			func(asset, st string) { app.metrics.SubmissionsTotal.WithLabelValues(asset, st).Inc() },
 			func(gas uint64) { app.metrics.GasUsed.Observe(float64(gas)) },
 		),
+		submitter.WithQueueMetrics(
+			func() { app.metrics.RequestsQueuedTotal.Inc() },
+			func(asset string) { app.metrics.RequestsExpiredTotal.WithLabelValues(asset).Inc() },
+			func(sec float64) { app.metrics.RequestProcessingDuration.Observe(sec) },
+		),
 	)
 	app.submitter = sub
 
@@ -233,6 +238,12 @@ func (app *App) Serve() error {
 	// Start healthz listener.
 	go func() { app.healthzDone <- app.healthz.Serve() }()
 
+	// Start the submitter pipeline (worker pool + sender + recovery) BEFORE
+	// the stream consumer + heartbeat, so enqueued requests have somewhere to go.
+	if err := app.submitter.Start(ctx); err != nil {
+		return fmt.Errorf("start submitter: %w", err)
+	}
+
 	// Start stream consumer + heartbeat.
 	app.streamConsumer.Start(ctx)
 	app.heartbeatSched.Start(ctx)
@@ -264,12 +275,14 @@ func (app *App) Stop() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
+		// Drain order: stop intake (heartbeat + stream) → drain the submitter
+		// pipeline (workers + sender + watchers) → transports → clients.
 		stopErr = errors.Join(
 			app.stopHeartbeat(ctx),
 			app.stopStream(ctx),
+			app.stopSubmitter(ctx),
 			app.stopGRPC(ctx),
 			app.stopHealthz(ctx),
-			app.stopSubmitter(),
 			app.closeIndexer(),
 			app.closePrice(),
 			app.closeChain(),
@@ -307,12 +320,11 @@ func (app *App) stopHealthz(ctx context.Context) error {
 	return app.healthz.Stop(ctx)
 }
 
-func (app *App) stopSubmitter() error {
+func (app *App) stopSubmitter(ctx context.Context) error {
 	if app.submitter == nil {
 		return nil
 	}
-	app.submitter.Wait()
-	return nil
+	return app.submitter.Stop(ctx)
 }
 
 func (app *App) closeIndexer() error {

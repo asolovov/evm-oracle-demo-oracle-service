@@ -73,6 +73,8 @@ func setDefaults() {
 	viper.SetDefault("submission.replace_after_sec", 60)
 	viper.SetDefault("submission.gas_multiplier", 1.1)
 	viper.SetDefault("submission.confirm_timeout_sec", 300)
+	viper.SetDefault("submission.workers", 4)
+	viper.SetDefault("submission.request_ttl_sec", 600)
 
 	// Heartbeat.
 	viper.SetDefault("heartbeat.enabled", true)
@@ -141,6 +143,12 @@ func (s *Scheme) Validate() error {
 	}
 	if s.Submission.GasMultiplier < 1.0 {
 		errs = append(errs, errors.New("submission.gas_multiplier must be >= 1.0"))
+	}
+	if s.Submission.Workers <= 0 {
+		errs = append(errs, errors.New("submission.workers must be > 0"))
+	}
+	if s.Submission.RequestTTLSec <= 0 {
+		errs = append(errs, errors.New("submission.request_ttl_sec must be > 0"))
 	}
 
 	if s.Conversion.OnChainDecimals <= 0 || s.Conversion.OnChainDecimals > 18 {

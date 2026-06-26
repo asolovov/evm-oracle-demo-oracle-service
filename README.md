@@ -18,10 +18,32 @@ price-service   ──(gRPC GetPrice)─────►        │
 Per [spec OQ-10](https://github.com/asolovov/evm-oracle-demo-protocols), the oracle is **reactive**:
 
 - Subscribes to `indexer.StreamEvents(kinds=[EVENT_KIND_PRICE_REQUESTED])` as a long-lived gRPC client. The indexer is the single chain-observer; events flow through this stream only after they cross the confirmation threshold.
-- On each delivered event: fetch aggregated price (double) from `price-service`, convert to int256 at Chainlink's 8-decimal scale, sign the EIP-712 digest with each reporter key, submit `fulfillPrice` to the asset's aggregator.
+- For each delivered event it fetches the aggregated price (double) from `price-service`, converts to int256 at Chainlink's 8-decimal scale, signs the EIP-712 digest with each reporter key, and submits `fulfillPrice` to the asset's aggregator.
 - Internal heartbeat scheduler emits time- and deviation-driven submissions (`reqId == 0`) without any inter-service RPC.
 
 The gRPC server surface is **admin + read only**: `SetHeartbeat`, `GetSubmissionStatus`, `ListSubmissions`. There is **no `TriggerUpdate`** — that was removed when the indexer became the single observer.
+
+### Async request pipeline (task 06.1)
+
+So that one un-priceable asset can never block the others (a real head-of-line stall found in live shakedown — silver's missing price wedged the whole stream, and every asset behind it stalled), the reaction path is fully asynchronous:
+
+```
+stream consumer ─▶ durably enqueue (queued row) + advance cursor immediately
+   requests ─▶ worker pool (SUBMISSION_WORKERS): price + convert + clamp + sign,
+               INDEPENDENT per request; transient failure (incl. price NotFound)
+               retries with backoff while within TTL, else becomes `expired`
+   signed   ─▶ sender (ONE goroutine, the only serialized stage): owns the
+               broadcaster nonce counter; broadcasts fulfillPrice; on success
+               → `pending` + confirmation watcher
+```
+
+- **Never blocks**: the stream consumer only enqueues + advances; a failing asset occupies at most one worker slot.
+- **Nonce serialization is the sole queue**: a single sender goroutine assigns strictly sequential nonces — workers price/sign concurrently, only broadcast is ordered.
+- **TTL** (`SUBMISSION_REQUEST_TTL_SEC`): a request not fulfilled in time is marked `expired` (terminal). TTL is **pre-broadcast only** — once a request consumes a nonce it runs to a terminal tx state, so an abandon can never gap the nonce sequence.
+- **Heartbeats** bypass the queue/TTL/recovery but still serialize through the sender.
+- **Crash recovery**: durable `queued`/`processing`/`sending` rows are re-enqueued on startup; overdue ones are expired.
+
+Single-instance design — dispatch is an in-memory channel (each request reaches exactly one worker) with the DB row for durability/observability/recovery; a multi-instance deployment would instead need a `FOR UPDATE SKIP LOCKED` claim.
 
 ## Quickstart
 
@@ -75,6 +97,7 @@ Sensible defaults:
 | `PRICE_ADDRESS` / `INDEXER_ADDRESS` | `price-service:9090` / `indexer-service:9090` |
 | `SIGNER_THRESHOLD` / `SIGNER_ALLOW_INSECURE_PERMS` | `2` / `false` |
 | `SUBMISSION_MAX_RETRIES` / `REPLACE_AFTER_SEC` / `GAS_MULTIPLIER` / `CONFIRM_TIMEOUT_SEC` | `3` / `60` / `1.1` / `300` |
+| `SUBMISSION_WORKERS` / `SUBMISSION_REQUEST_TTL_SEC` | `4` / `600` (async pool size / pre-broadcast request TTL) |
 | `HEARTBEAT_ENABLED` / `INTERVAL_SEC` / `DEVIATION_THRESHOLD` | `true` / `3600` / `0.015` |
 | `CONVERSION_ON_CHAIN_DECIMALS` | `8` (Chainlink scale) |
 

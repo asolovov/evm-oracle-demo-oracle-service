@@ -7,6 +7,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -32,7 +33,24 @@ type Repository interface {
 	GetSubmissionByReqID(ctx context.Context, reqID string) (*models.Submission, error)
 	GetSubmissionByTxHash(ctx context.Context, txHash string) (*models.Submission, error)
 	ListSubmissions(ctx context.Context, assetID string, limit, offset int) ([]*models.Submission, int, error)
-	ExistsByReqID(ctx context.Context, reqID string) (bool, error)
+	// ExistsForAggregatorReqID is the streamconsumer's idempotency check.
+	// MUST be scoped by (aggregator, req_id) — req_id is per-aggregator on
+	// chain, so two aggregators legitimately share the same req_id (every
+	// asset has its own counter starting at 1).
+	ExistsForAggregatorReqID(ctx context.Context, aggregator common.Address, reqID string) (bool, error)
+
+	// Async pipeline (task 06.1).
+	// EnqueueRequest persists a price-less `queued` row with a TTL deadline and
+	// returns its id. The price + tx are filled in later by the worker/sender.
+	EnqueueRequest(ctx context.Context, s *models.Submission) (int64, error)
+	// MarkExpired terminally abandons a pre-broadcast request that blew its TTL.
+	MarkExpired(ctx context.Context, id int64, lastErr string) error
+	// LoadResumable returns non-terminal pre-broadcast rows
+	// (queued/processing/sending) for startup recovery, with ExpiresAt set.
+	LoadResumable(ctx context.Context) ([]*models.Submission, error)
+	// ExpireOverdue bulk-marks `expired` any non-terminal row whose TTL has
+	// already passed. Returns the count expired.
+	ExpireOverdue(ctx context.Context) (int, error)
 
 	// Pending tx tracking (restart resilience).
 	InsertPendingTx(ctx context.Context, submissionID int64, txHash string, nonce uint64, gasStrategyJSON []byte) error
@@ -135,7 +153,7 @@ func (r *PgxRepository) InsertSubmission(ctx context.Context, s *models.Submissi
 		s.AssetID,
 		s.Aggregator.Hex(),
 		txHashStr(s.TxHash),
-		s.SubmittedPrice,
+		nullableStr(s.SubmittedPrice),
 		nowOrPassed(s.SubmittedAt),
 		s.Status.String(),
 		s.RetryCount,
@@ -164,7 +182,7 @@ func (r *PgxRepository) UpdateSubmission(ctx context.Context, s *models.Submissi
 	tag, err := r.pool.Exec(ctx, updateSubmissionSQL,
 		s.ID,
 		txHashStr(s.TxHash),
-		s.SubmittedPrice,
+		nullableStr(s.SubmittedPrice),
 		nowOrPassed(s.SubmittedAt),
 		s.Status.String(),
 		s.RetryCount,
@@ -246,21 +264,139 @@ func (r *PgxRepository) ListSubmissions(ctx context.Context, assetID string, lim
 	return out, total, nil
 }
 
-const existsByReqIDSQL = `
+const existsForAggregatorReqIDSQL = `
 SELECT EXISTS (
     SELECT 1 FROM oracle_submissions
-    WHERE  req_id = $1 AND req_id <> '0'
+    WHERE  req_id = $1
+      AND  aggregator = $2
+      AND  req_id <> '0'
 )`
 
-// ExistsByReqID is the idempotency check the stream consumer hits before
-// dispatching a delivered event. Heartbeat submissions (req_id == "0") are
-// excluded by definition.
-func (r *PgxRepository) ExistsByReqID(ctx context.Context, reqID string) (bool, error) {
+// ExistsForAggregatorReqID is the idempotency check the stream consumer
+// hits before dispatching a delivered event. Scoped by (aggregator, req_id)
+// because req_id is per-aggregator on chain — every asset's PriceAggregator
+// has its own counter, so the same req_id value coexists across all 10
+// assets. Scoping by req_id alone (as the original implementation did)
+// caused the second-and-subsequent asset's events to be silently skipped
+// after the first asset's row was persisted. See bugfix note #4 in
+// docs/SECURITY.md for the live-debug forensics.
+//
+// Heartbeat submissions (req_id == "0") are excluded by definition.
+func (r *PgxRepository) ExistsForAggregatorReqID(ctx context.Context, aggregator common.Address, reqID string) (bool, error) {
 	var exists bool
-	if err := r.pool.QueryRow(ctx, existsByReqIDSQL, reqID).Scan(&exists); err != nil {
-		return false, fmt.Errorf("exists by req_id: %w", err)
+	err := r.pool.QueryRow(ctx, existsForAggregatorReqIDSQL, reqID, aggregator.Hex()).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("exists by aggregator+req_id: %w", err)
 	}
 	return exists, nil
+}
+
+// ---------------------------------------------------------------------------
+// Async request queue (task 06.1)
+// ---------------------------------------------------------------------------
+
+const enqueueRequestSQL = `
+INSERT INTO oracle_submissions (req_id, asset_id, aggregator, tx_hash,
+                                submitted_price, submitted_at, status,
+                                retry_count, last_error, queued_at, expires_at)
+VALUES ($1, $2, $3, '', NULL, now(), 'queued', 0, '', now(), $4)
+RETURNING id`
+
+// EnqueueRequest persists a price-less `queued` row with its TTL deadline.
+// The streamconsumer's ExistsForAggregatorReqID call upstream provides the
+// (aggregator, req_id) idempotency, so this is a plain insert.
+func (r *PgxRepository) EnqueueRequest(ctx context.Context, s *models.Submission) (int64, error) {
+	var id int64
+	err := r.pool.QueryRow(ctx, enqueueRequestSQL,
+		s.ReqID,
+		s.AssetID,
+		s.Aggregator.Hex(),
+		s.ExpiresAt,
+	).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("enqueue request: %w", err)
+	}
+	s.ID = id
+	return id, nil
+}
+
+const markExpiredSQL = `
+UPDATE oracle_submissions
+SET    status = 'expired', last_error = $2, updated_at = now()
+WHERE  id = $1
+  AND  status IN ('queued', 'processing', 'sending')`
+
+// MarkExpired terminally abandons a pre-broadcast request. The status guard
+// ensures we never expire a row that has already consumed a nonce (pending+).
+func (r *PgxRepository) MarkExpired(ctx context.Context, id int64, lastErr string) error {
+	_, err := r.pool.Exec(ctx, markExpiredSQL, id, lastErr)
+	if err != nil {
+		return fmt.Errorf("mark expired: %w", err)
+	}
+	return nil
+}
+
+const loadResumableSQL = `
+SELECT id, req_id, asset_id, aggregator, tx_hash, submitted_price,
+       submitted_at, status, retry_count, last_error, expires_at
+FROM   oracle_submissions
+WHERE  status IN ('queued', 'processing', 'sending')
+ORDER  BY id`
+
+// LoadResumable returns pre-broadcast non-terminal rows for startup recovery.
+func (r *PgxRepository) LoadResumable(ctx context.Context) ([]*models.Submission, error) {
+	rows, err := r.pool.Query(ctx, loadResumableSQL)
+	if err != nil {
+		return nil, fmt.Errorf("load resumable: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*models.Submission, 0)
+	for rows.Next() {
+		var (
+			s             models.Submission
+			aggregatorHex string
+			txHashHex     string
+			price         sql.NullString
+			statusStr     string
+			expiresAt     sql.NullTime
+		)
+		if err := rows.Scan(&s.ID, &s.ReqID, &s.AssetID, &aggregatorHex, &txHashHex,
+			&price, &s.SubmittedAt, &statusStr, &s.RetryCount, &s.LastError, &expiresAt); err != nil {
+			return nil, fmt.Errorf("scan resumable: %w", err)
+		}
+		s.Aggregator = common.HexToAddress(aggregatorHex)
+		if txHashHex != "" {
+			s.TxHash = common.HexToHash(txHashHex)
+		}
+		s.SubmittedPrice = price.String
+		if expiresAt.Valid {
+			s.ExpiresAt = expiresAt.Time
+		}
+		status, err := models.ParseSubmissionStatus(statusStr)
+		if err != nil {
+			return nil, fmt.Errorf("decode resumable status: %w", err)
+		}
+		s.Status = status
+		out = append(out, &s)
+	}
+	return out, rows.Err()
+}
+
+const expireOverdueSQL = `
+UPDATE oracle_submissions
+SET    status = 'expired', last_error = 'ttl exceeded (overdue sweep)', updated_at = now()
+WHERE  status IN ('queued', 'processing', 'sending')
+  AND  expires_at IS NOT NULL
+  AND  expires_at < now()`
+
+// ExpireOverdue bulk-marks expired any pre-broadcast row whose TTL has passed.
+func (r *PgxRepository) ExpireOverdue(ctx context.Context) (int, error) {
+	tag, err := r.pool.Exec(ctx, expireOverdueSQL)
+	if err != nil {
+		return 0, fmt.Errorf("expire overdue: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +594,7 @@ func scanSubmission(r rowScanner) (*models.Submission, error) {
 		s             models.Submission
 		aggregatorHex string
 		txHashHex     string
+		price         sql.NullString
 		statusStr     string
 	)
 	err := r.Scan(
@@ -466,7 +603,7 @@ func scanSubmission(r rowScanner) (*models.Submission, error) {
 		&s.AssetID,
 		&aggregatorHex,
 		&txHashHex,
-		&s.SubmittedPrice,
+		&price,
 		&s.SubmittedAt,
 		&statusStr,
 		&s.RetryCount,
@@ -479,6 +616,7 @@ func scanSubmission(r rowScanner) (*models.Submission, error) {
 	if txHashHex != "" {
 		s.TxHash = common.HexToHash(txHashHex)
 	}
+	s.SubmittedPrice = price.String // empty when NULL (queued/expired rows)
 	status, err := models.ParseSubmissionStatus(statusStr)
 	if err != nil {
 		return nil, fmt.Errorf("decode submission status: %w", err)
@@ -492,6 +630,15 @@ func txHashStr(h common.Hash) string {
 		return ""
 	}
 	return h.Hex()
+}
+
+// nullableStr maps an empty string to a SQL NULL so a price-less `queued` row
+// stores NULL rather than a misleading "" in submitted_price.
+func nullableStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 func nowOrPassed(t time.Time) time.Time {

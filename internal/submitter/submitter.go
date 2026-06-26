@@ -1,21 +1,29 @@
 // Package submitter is the oracle-service's price-submission business logic.
 //
-// Entry points:
+// Async pipeline (task 06.1) — designed so one un-priceable asset can never
+// block any other:
 //
-//   - HandleEvent(ctx, ev): called by the stream consumer for each
-//     PriceRequestedEvent delivered past the indexer confirmation gate.
-//     Fetches the aggregated price from price-service, converts to the
-//     on-chain int256 scale, signs the EIP-712 digest with each reporter
-//     key, broadcasts fulfillPrice, persists the submission row, and kicks
-//     off a background watcher that drives the tx to terminal state
-//     (confirmed | failed | dropped).
+//	stream consumer ──HandleEvent──▶ durably enqueue (queued row) + push to
+//	    requests channel, return fast (cursor advances immediately)
+//	requests channel ──▶ worker pool (N goroutines): fetch price + convert +
+//	    clamp timestamp + sign — INDEPENDENT per request; a slow/failing asset
+//	    occupies at most one slot. Transient failure → requeue with backoff
+//	    while within TTL; past TTL → `expired` (terminal, pre-broadcast only).
+//	signed payloads ──▶ sender (ONE goroutine): owns the broadcaster nonce
+//	    counter, the only serialized stage. Broadcasts fulfillPrice; permanent
+//	    revert → `failed`; transient → requeue (nonce NOT advanced); success →
+//	    `pending` + spawn confirmation watcher.
 //
-//   - HandleHeartbeat(ctx, assetID): called by the heartbeat scheduler for
-//     each per-asset tick. Heartbeat submissions use reqId == 0 per spec.
+// Heartbeat submissions (reqId == 0) BYPASS the queue/TTL/recovery — they are
+// scheduler-driven and internally rate-limited — but still serialize through
+// the sender for nonce safety.
 //
-// Architecture rule 4 / 5: this is internal business logic, not a template
-// module. application.go wires Submitter once and hands the dispatcher seam
-// to the stream consumer + heartbeat scheduler.
+// Single-instance design: dispatch is an in-memory channel (each item reaches
+// exactly one worker), with the DB row purely for durability + observability +
+// crash recovery. A multi-instance deployment would instead need a
+// `FOR UPDATE SKIP LOCKED` claim; out of scope for this single-VPS service.
+//
+// Architecture rule 4 / 5: internal business logic, not a template module.
 package submitter
 
 import (
@@ -39,8 +47,7 @@ import (
 	"github.com/asolovov/evm-oracle-demo-oracle-service/internal/models"
 )
 
-// ChainClient is the chain-package surface the submitter depends on. Defined
-// as an interface so unit tests can sub a fake without a live RPC.
+// ChainClient is the chain-package surface the submitter depends on.
 type ChainClient interface {
 	SuggestGas(ctx context.Context, attempt int) (chainpkg.GasStrategy, error)
 	NonceAt(ctx context.Context, addr common.Address) (uint64, error)
@@ -51,7 +58,7 @@ type ChainClient interface {
 		aggregator common.Address, reqID, price, timestamp *big.Int,
 		signatures [][]byte, gas chainpkg.GasStrategy) (common.Hash, error)
 	TxReceipt(ctx context.Context, hash common.Hash) (*types.Receipt, error)
-	LatestRoundData(ctx context.Context, aggregator common.Address) (*big.Int, *big.Int, error)
+	LatestStartedAt(ctx context.Context, aggregator common.Address) (*big.Int, error)
 }
 
 // PriceClient is the price-service gRPC surface.
@@ -69,10 +76,34 @@ type SignerClient interface {
 
 // Repo is the repository surface the submitter needs.
 type Repo interface {
-	InsertSubmission(ctx context.Context, s *models.Submission) (int64, error)
+	EnqueueRequest(ctx context.Context, s *models.Submission) (int64, error)
 	UpdateSubmission(ctx context.Context, s *models.Submission) error
+	InsertSubmission(ctx context.Context, s *models.Submission) (int64, error)
+	MarkExpired(ctx context.Context, id int64, lastErr string) error
+	LoadResumable(ctx context.Context) ([]*models.Submission, error)
+	ExpireOverdue(ctx context.Context) (int, error)
 	InsertPendingTx(ctx context.Context, submissionID int64, txHash string, nonce uint64, gasStrategyJSON []byte) error
 	DeletePendingTx(ctx context.Context, txHash string) error
+}
+
+// workItem is a request flowing through the worker pool. submissionID is the
+// durable `oracle_submissions` row id (0 for heartbeats, which have no row).
+type workItem struct {
+	submissionID int64
+	symbol       string
+	aggregator   common.Address
+	reqID        *big.Int
+	expiresAt    time.Time // zero => no TTL (heartbeat)
+	heartbeat    bool
+	attempts     int
+}
+
+// signedTx is a fully-priced, signed payload ready for the sender to broadcast.
+type signedTx struct {
+	item  *workItem
+	price *big.Int
+	ts    *big.Int
+	sigs  [][]byte
 }
 
 // Submitter is the wiring point. One per service.
@@ -84,30 +115,31 @@ type Submitter struct {
 	cfg    *config.SubmissionConfig
 	conv   *config.ConversionConfig
 
-	// Address->symbol reverse lookup, built once from config.Chain.AggregatorAddresses.
-	bySymbol  map[string]common.Address
-	byAddress map[common.Address]string
-
-	// On-chain assetId per aggregator. Populated at startup by application.go
-	// from chain.AssetID(addr) — NOT re-derived from the symbol off-chain.
-	// The contract owns the canonical bytes32; off-chain re-derivation is
-	// fragile because the deploy script used a different symbol case than
-	// the price-service wire format (a live debug session caught the
-	// resulting digest mismatch as fulfillPrice -> InsufficientSignatures ->
-	// `execution reverted`).
+	bySymbol            map[string]common.Address
+	byAddress           map[common.Address]string
 	assetIDByAggregator map[common.Address]common.Hash
 
 	log *logrus.Entry
 
-	wg sync.WaitGroup
+	workers      int
+	ttl          time.Duration
+	pollEvery    time.Duration
+	retryBackoff time.Duration // base unit; backoff = retryBackoff*attempts, capped
 
-	// Polling cadence for the per-submission watcher. Defaults to 5s; tests
-	// override via WithPollInterval to keep them fast.
-	pollEvery time.Duration
+	requests chan *workItem
+	sendCh   chan *signedTx
+	nonce    uint64 // owned exclusively by the single sender goroutine; no lock
+
+	wg       sync.WaitGroup
+	stop     chan struct{}
+	stopOnce sync.Once
 
 	// Metrics hooks (nil-tolerant).
 	onSubmission func(asset, status string)
 	onGasUsed    func(uint64)
+	onQueued     func()
+	onExpired    func(asset string)
+	onProcessing func(seconds float64)
 }
 
 // Option tunes the Submitter at construction time.
@@ -118,11 +150,20 @@ func WithLogger(log *logrus.Entry) Option {
 	return func(s *Submitter) { s.log = log }
 }
 
-// WithMetricsHooks wires Prometheus counters. Nil hooks are ignored.
+// WithMetricsHooks wires the submission + gas Prometheus counters.
 func WithMetricsHooks(onSubmission func(asset, status string), onGasUsed func(uint64)) Option {
 	return func(s *Submitter) {
 		s.onSubmission = onSubmission
 		s.onGasUsed = onGasUsed
+	}
+}
+
+// WithQueueMetrics wires the async-pipeline counters (task 06.1). Nil hooks ignored.
+func WithQueueMetrics(onQueued func(), onExpired func(asset string), onProcessing func(float64)) Option {
+	return func(s *Submitter) {
+		s.onQueued = onQueued
+		s.onExpired = onExpired
+		s.onProcessing = onProcessing
 	}
 }
 
@@ -131,14 +172,13 @@ func WithPollInterval(d time.Duration) Option {
 	return func(s *Submitter) { s.pollEvery = d }
 }
 
-// New constructs a Submitter from its dependencies + the chain aggregator
-// table from config + the on-chain assetId map from application startup.
-//
-// assetIDByAggregator MUST contain an entry for every address in
-// aggregatorAddresses (application.go enforces this by failing Init() if
-// the chain.AssetID() lookup errored for any aggregator). The map carries
-// the authoritative bytes32 used in the EIP-712 digest; without it the
-// submitter cannot produce signatures the contract's ReporterSet accepts.
+// WithRetryBackoff overrides the base retry backoff (default 2s). Used by tests
+// to keep TTL/retry assertions fast.
+func WithRetryBackoff(d time.Duration) Option {
+	return func(s *Submitter) { s.retryBackoff = d }
+}
+
+// New constructs a Submitter. Call Start to launch the worker pool + sender.
 func New(c ChainClient, p PriceClient, sgn SignerClient, repo Repo,
 	cfg *config.SubmissionConfig, conv *config.ConversionConfig,
 	aggregatorAddresses map[string]string,
@@ -154,12 +194,27 @@ func New(c ChainClient, p PriceClient, sgn SignerClient, repo Repo,
 		byAddr[a] = s
 	}
 
+	workers := cfg.Workers
+	if workers <= 0 {
+		workers = 1
+	}
+	ttl := time.Duration(cfg.RequestTTLSec) * time.Second
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+
 	sub := &Submitter{
 		chain: c, price: p, signer: sgn, repo: repo,
 		cfg: cfg, conv: conv,
 		bySymbol: bySym, byAddress: byAddr,
 		assetIDByAggregator: assetIDByAggregator,
+		workers:             workers,
+		ttl:                 ttl,
 		pollEvery:           5 * time.Second,
+		retryBackoff:        2 * time.Second,
+		requests:            make(chan *workItem, workers*8),
+		sendCh:              make(chan *signedTx, workers*2),
+		stop:                make(chan struct{}),
 		log:                 logrus.NewEntry(logrus.StandardLogger()).WithField("component", "submitter"),
 	}
 	for _, opt := range opts {
@@ -168,11 +223,47 @@ func New(c ChainClient, p PriceClient, sgn SignerClient, repo Repo,
 	return sub
 }
 
-// Wait blocks until all in-flight tx watchers exit. Called by Stop().
+// Start seeds the sender's nonce, launches the sender + worker pool, and runs
+// startup recovery (re-enqueue durable non-terminal rows; expire the overdue).
+func (s *Submitter) Start(ctx context.Context) error {
+	n, err := s.chain.NonceAt(ctx, s.signer.BroadcasterAddress())
+	if err != nil {
+		return fmt.Errorf("seed broadcaster nonce: %w", err)
+	}
+	s.nonce = n
+
+	s.wg.Add(1)
+	go s.runSender()
+
+	for i := 0; i < s.workers; i++ {
+		s.wg.Add(1)
+		go s.runWorker()
+	}
+
+	s.recover(ctx)
+	s.log.WithFields(logrus.Fields{"workers": s.workers, "ttl": s.ttl.String(), "nonce": n}).
+		Info("submitter pipeline started")
+	return nil
+}
+
+// Stop signals the pipeline to drain and waits (bounded by ctx).
+func (s *Submitter) Stop(ctx context.Context) error {
+	s.stopOnce.Do(func() { close(s.stop) })
+	done := make(chan struct{})
+	go func() { s.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Wait blocks until the pipeline fully drains. Retained for callers that only
+// need the join (e.g. tests).
 func (s *Submitter) Wait() { s.wg.Wait() }
 
-// AggregatorBySymbol returns the configured aggregator for a lowercase
-// symbol. Used by the heartbeat scheduler.
+// AggregatorBySymbol returns the configured aggregator for a lowercase symbol.
 func (s *Submitter) AggregatorBySymbol(symbol string) (common.Address, bool) {
 	a, ok := s.bySymbol[strings.ToLower(symbol)]
 	return a, ok
@@ -187,281 +278,85 @@ func (s *Submitter) SymbolsManaged() []string {
 	return out
 }
 
-// HandleEvent is the streamconsumer.Dispatcher seam.
+// HandleEvent is the streamconsumer.Dispatcher seam. It durably enqueues the
+// request and returns immediately so the consumer can advance its cursor —
+// the actual price-fetch/sign/broadcast happens asynchronously. Only a DB
+// failure (genuinely transient) returns an error and blocks the cursor.
 func (s *Submitter) HandleEvent(ctx context.Context, ev *indexerv1.Event) error {
 	pr := ev.GetPriceRequested()
 	if pr == nil {
 		return errors.New("event is not PriceRequested")
 	}
-	aggregatorAddr := common.HexToAddress(ev.GetMeta().GetContractAddress())
+	aggregator := common.HexToAddress(ev.GetMeta().GetContractAddress())
 
-	symbol, ok := s.byAddress[aggregatorAddr]
+	symbol, ok := s.byAddress[aggregator]
 	if !ok {
-		s.log.WithField("aggregator", aggregatorAddr.Hex()).
-			Warn("skipping event from unknown aggregator")
-		// Returning nil so the stream consumer still advances its cursor; the
-		// alternative would re-receive forever events for assets we don't
-		// manage.
+		// Asset we don't manage — skip + let the consumer advance.
+		s.log.WithField("aggregator", aggregator.Hex()).Warn("skipping event from unknown aggregator")
 		return nil
 	}
 
 	reqID, ok := models.ReqIDToBigInt(pr.GetReqId())
 	if !ok {
-		return fmt.Errorf("malformed req_id %q", pr.GetReqId())
-	}
-
-	return s.submit(ctx, symbol, aggregatorAddr, reqID)
-}
-
-// HandleHeartbeat is the heartbeat-scheduler seam.
-func (s *Submitter) HandleHeartbeat(ctx context.Context, symbol string) error {
-	aggregatorAddr, ok := s.AggregatorBySymbol(symbol)
-	if !ok {
-		return fmt.Errorf("unknown symbol %q", symbol)
-	}
-	return s.submit(ctx, symbol, aggregatorAddr, big.NewInt(0))
-}
-
-// submit is the shared inner path. The only difference between consumer-
-// driven and heartbeat submissions is the reqId.
-func (s *Submitter) submit(ctx context.Context, symbol string, aggregator common.Address, reqID *big.Int) error {
-	log := s.log.WithFields(logrus.Fields{
-		"symbol":     symbol,
-		"req_id":     reqID.String(),
-		"aggregator": aggregator.Hex(),
-	})
-
-	priceMsg, err := s.price.GetPrice(ctx, symbol)
-	if err != nil {
-		return fmt.Errorf("get price for %s: %w", symbol, err)
-	}
-
-	priceInt, err := models.FloatToInt256(priceMsg.GetMedianPrice(), s.conv.OnChainDecimals)
-	if err != nil {
-		return fmt.Errorf("convert price to int256: %w", err)
-	}
-
-	assetID, ok := s.assetIDByAggregator[aggregator]
-	if !ok {
-		// Should never happen — application.go pre-loads the map for every
-		// configured aggregator and fails Init() on missing entries. Guard
-		// anyway so a future wiring regression surfaces loudly.
-		return fmt.Errorf("missing on-chain assetId for aggregator %s", aggregator.Hex())
-	}
-
-	ts := time.Now().UTC()
-	if msgTs := priceMsg.GetAggregatedAt(); msgTs != nil {
-		ts = msgTs.AsTime()
-	}
-	tsBI := big.NewInt(ts.Unix())
-
-	digest, err := s.signer.BuildDigest(reqID, assetID, priceInt, tsBI, aggregator)
-	if err != nil {
-		return fmt.Errorf("build digest: %w", err)
-	}
-	sigs, err := s.signer.Sign(digest)
-	if err != nil {
-		return fmt.Errorf("sign: %w", err)
-	}
-
-	broadcaster := s.signer.BroadcasterAddress()
-	nonce, err := s.chain.NonceAt(ctx, broadcaster)
-	if err != nil {
-		return fmt.Errorf("pin nonce: %w", err)
-	}
-	auth, err := s.signer.NewBroadcaster()
-	if err != nil {
-		return fmt.Errorf("build transactor opts: %w", err)
-	}
-	auth.Nonce = new(big.Int).SetUint64(nonce)
-
-	gas, err := s.chain.SuggestGas(ctx, 0)
-	if err != nil {
-		return fmt.Errorf("suggest gas: %w", err)
-	}
-
-	txHash, err := s.chain.SubmitFulfillment(ctx, auth, aggregator, reqID, priceInt, tsBI, sigs, gas)
-	if err != nil {
-		// Two distinct failure classes need different handling here.
-		//
-		// TRANSIENT (insufficient funds, RPC unreachable, nonce race): the
-		// world may change and the same calldata could succeed later. Don't
-		// persist anything — if we did, the streamconsumer's ExistsByReqID
-		// idempotency check would latch this req_id as terminal and skip it
-		// forever. Propagate the error so the consumer blocks cursor advance
-		// and the event redelivers on the next stream pass.
-		//
-		// PERMANENT (eth_estimateGas / eth_call sim returned `execution
-		// reverted`): the calldata is deterministically rejected by the
-		// contract — for example a digest the ReporterSet refuses, a stale
-		// timestamp, or a req_id that was already fulfilled. Re-broadcasting
-		// the same calldata cannot change this. Persist STATUS_FAILED with
-		// the revert reason so operators see the dead submission in
-		// ListSubmissions, then return nil so the streamconsumer advances
-		// its cursor past the event and stops retrying.
-		//
-		// On-chain reverts AFTER broadcast (the watcher's receipt-status=0
-		// path) take a separate route — see finaliseFromReceipt below.
-		if chainpkg.IsRevertError(err) {
-			failed := &models.Submission{
-				ReqID:          reqID.String(),
-				AssetID:        symbol,
-				Aggregator:     aggregator,
-				SubmittedPrice: priceInt.String(),
-				SubmittedAt:    time.Now().UTC(),
-				Status:         models.SubmissionStatusFailed,
-				LastError:      err.Error(),
-			}
-			if _, insErr := s.repo.InsertSubmission(ctx, failed); insErr != nil {
-				log.WithError(insErr).Error("persist FAILED row after permanent revert")
-				// Fall through and propagate the original error so the consumer
-				// retries; better than silently losing the record.
-				return fmt.Errorf("broadcast fulfillPrice (permanent): %w", err)
-			}
-			s.markSubmissionMetric(symbol, models.SubmissionStatusFailed)
-			log.WithError(err).Error("broadcast fulfillPrice reverted; persisted FAILED, advancing past event")
-			return nil
-		}
-		log.WithError(err).Error("broadcast fulfillPrice failed; not persisting (transient — will retry on next stream pass)")
-		return fmt.Errorf("broadcast fulfillPrice: %w", err)
+		// Malformed req_id is a permanent property of this event — skip +
+		// advance rather than wedge the stream on it forever.
+		s.log.WithField("req_id", pr.GetReqId()).Warn("malformed req_id; skipping")
+		return nil
 	}
 
 	sub := &models.Submission{
-		ReqID:          reqID.String(),
-		AssetID:        symbol,
-		Aggregator:     aggregator,
-		TxHash:         txHash,
-		SubmittedPrice: priceInt.String(),
-		SubmittedAt:    time.Now().UTC(),
-		Status:         models.SubmissionStatusPending,
+		ReqID:      pr.GetReqId(),
+		AssetID:    symbol,
+		Aggregator: aggregator,
+		Status:     models.SubmissionStatusQueued,
+		ExpiresAt:  time.Now().Add(s.ttl),
 	}
-	id, err := s.repo.InsertSubmission(ctx, sub)
+	id, err := s.repo.EnqueueRequest(ctx, sub)
 	if err != nil {
-		return fmt.Errorf("persist submission: %w", err)
+		// DB unreachable — genuinely transient; propagate so the consumer
+		// blocks the cursor and redelivers (the only legitimate block case).
+		return fmt.Errorf("enqueue request: %w", err)
 	}
-	sub.ID = id
-	if err := s.repo.InsertPendingTx(ctx, id, txHash.Hex(), nonce, nil); err != nil {
-		log.WithError(err).Warn("persist pending tx (non-fatal)")
+	if s.onQueued != nil {
+		s.onQueued()
 	}
-	s.markSubmissionMetric(symbol, models.SubmissionStatusPending)
-	log.WithField("tx_hash", txHash.Hex()).Info("fulfillPrice broadcast")
-
-	s.wg.Add(1)
-	//nolint:gosec // G118 — watcher must outlive the inbound request context so in-flight txs aren't stranded
-	go func() {
-		defer s.wg.Done()
-		s.watch(context.Background(), sub, auth, aggregator, priceInt, tsBI, sigs)
-	}()
+	_ = reqID // parsed for validation; the worker re-parses from the row on dispatch
+	s.enqueueItem(&workItem{
+		submissionID: id,
+		symbol:       symbol,
+		aggregator:   aggregator,
+		reqID:        reqID,
+		expiresAt:    sub.ExpiresAt,
+	})
 	return nil
 }
 
-func (s *Submitter) watch(
-	ctx context.Context,
-	sub *models.Submission,
-	auth *bind.TransactOpts,
-	aggregator common.Address,
-	priceInt, tsBI *big.Int,
-	sigs [][]byte,
-) {
-	replaceAfter := time.Duration(s.cfg.ReplaceAfterSec) * time.Second
-	confirmDeadline := time.Now().Add(time.Duration(s.cfg.ConfirmTimeoutSec) * time.Second)
-
-	log := s.log.WithFields(logrus.Fields{
-		"submission_id": sub.ID,
-		"req_id":        sub.ReqID,
-		"asset":         sub.AssetID,
+// HandleHeartbeat is the heartbeat-scheduler seam. Heartbeats bypass the
+// durable queue + TTL (they are periodic and re-fire on the next tick) but
+// still go through the worker → sender path for nonce serialization.
+func (s *Submitter) HandleHeartbeat(_ context.Context, symbol string) error {
+	aggregator, ok := s.AggregatorBySymbol(symbol)
+	if !ok {
+		return fmt.Errorf("unknown symbol %q", symbol)
+	}
+	s.enqueueItem(&workItem{
+		symbol:     symbol,
+		aggregator: aggregator,
+		reqID:      big.NewInt(0),
+		heartbeat:  true,
 	})
-
-	lastBroadcast := time.Now()
-
-	for {
-		if time.Now().After(confirmDeadline) {
-			s.markDropped(ctx, sub)
-			log.Warn("submission dropped after confirm timeout")
-			return
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(s.pollEvery):
-		}
-
-		receipt, err := s.chain.TxReceipt(ctx, sub.TxHash)
-		switch {
-		case err == nil:
-			s.finalizeFromReceipt(ctx, sub, receipt)
-			if s.onGasUsed != nil {
-				s.onGasUsed(receipt.GasUsed)
-			}
-			return
-		case errors.Is(err, chainpkg.ErrTxNotMined):
-			// expected pre-mine state
-		default:
-			log.WithError(err).Warn("receipt poll error (will retry)")
-			continue
-		}
-
-		if time.Since(lastBroadcast) < replaceAfter {
-			continue
-		}
-		if sub.RetryCount >= s.cfg.MaxRetries {
-			s.markDropped(ctx, sub)
-			log.Warn("submission dropped after max retries")
-			return
-		}
-
-		newGas, err := s.chain.SuggestGas(ctx, sub.RetryCount+1)
-		if err != nil {
-			log.WithError(err).Warn("replace gas suggest failed")
-			continue
-		}
-		newHash, err := s.chain.ReplaceFulfillment(ctx, auth, aggregator,
-			mustBigInt(sub.ReqID), priceInt, tsBI, sigs, newGas)
-		if err != nil {
-			log.WithError(err).Warn("replace broadcast failed")
-			continue
-		}
-		old := sub.TxHash
-		sub.TxHash = newHash
-		sub.RetryCount++
-		sub.LastError = ""
-		if uerr := s.repo.UpdateSubmission(ctx, sub); uerr != nil {
-			log.WithError(uerr).Warn("update submission after replace")
-		}
-		_ = s.repo.DeletePendingTx(ctx, old.Hex())
-		_ = s.repo.InsertPendingTx(ctx, sub.ID, newHash.Hex(), auth.Nonce.Uint64(), nil)
-		lastBroadcast = time.Now()
-		log.WithFields(logrus.Fields{
-			"old_tx": old.Hex(),
-			"new_tx": newHash.Hex(),
-			"retry":  sub.RetryCount,
-		}).Info("replace-by-fee submitted")
-	}
+	return nil
 }
 
-func (s *Submitter) finalizeFromReceipt(ctx context.Context, sub *models.Submission, r *types.Receipt) {
-	switch r.Status {
-	case types.ReceiptStatusSuccessful:
-		sub.Status = models.SubmissionStatusConfirmed
-	default:
-		sub.Status = models.SubmissionStatusFailed
-		sub.LastError = "tx reverted"
+// enqueueItem pushes onto the worker channel, honoring shutdown. Mild
+// backpressure on a full channel is acceptable (it rate-limits intake; it does
+// NOT wedge on a single failing asset, since failures requeue via delayed
+// timers rather than hot-looping the channel).
+func (s *Submitter) enqueueItem(item *workItem) {
+	select {
+	case s.requests <- item:
+	case <-s.stop:
 	}
-	if err := s.repo.UpdateSubmission(ctx, sub); err != nil {
-		s.log.WithError(err).Warn("update submission on finalize")
-	}
-	_ = s.repo.DeletePendingTx(ctx, sub.TxHash.Hex())
-	s.markSubmissionMetric(sub.AssetID, sub.Status)
-}
-
-func (s *Submitter) markDropped(ctx context.Context, sub *models.Submission) {
-	sub.Status = models.SubmissionStatusDropped
-	if err := s.repo.UpdateSubmission(ctx, sub); err != nil {
-		s.log.WithError(err).Warn("update submission on dropped")
-	}
-	_ = s.repo.DeletePendingTx(ctx, sub.TxHash.Hex())
-	s.markSubmissionMetric(sub.AssetID, sub.Status)
 }
 
 func (s *Submitter) markSubmissionMetric(asset string, st models.SubmissionStatus) {
