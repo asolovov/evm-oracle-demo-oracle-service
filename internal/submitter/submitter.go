@@ -283,22 +283,21 @@ func (s *Submitter) Start(ctx context.Context) error {
 		seeds[addr.Hex()] = n
 	}
 
-	// Breaker transition hooks: fire the funds-exhausted event + flip the gauge
-	// exactly once per transition (not per attempt).
+	// Breaker hooks. onOpen/onClose fire ONCE per funds episode (event + log);
+	// onSuspendChange drives the gauge on every suspend/resume transition.
 	s.breaker.onOpen = func() {
 		if s.onFundsBlocked != nil {
 			s.onFundsBlocked()
 		}
-		if s.onBreaker != nil {
-			s.onBreaker(true)
-		}
-		s.log.Error("ALL broadcaster wallets drained — broadcasting suspended; will probe for refunded wallet on backoff")
+		s.log.Error("ALL broadcaster wallets drained — broadcasting suspended; will probe for a refunded wallet on backoff")
 	}
 	s.breaker.onClose = func() {
-		if s.onBreaker != nil {
-			s.onBreaker(false)
-		}
 		s.log.Info("broadcaster wallet funded again — broadcasting resumed")
+	}
+	s.breaker.onSuspendChange = func(suspended bool) {
+		if s.onBreaker != nil {
+			s.onBreaker(suspended)
+		}
 	}
 
 	s.wg.Add(1)
@@ -326,7 +325,7 @@ func (s *Submitter) Start(ctx context.Context) error {
 // broadcaster wallet is drained). The heartbeat scheduler consults this to
 // pause firing instead of enqueuing doomed work every tick (task 06.2).
 func (s *Submitter) BroadcastSuspended() bool {
-	return s.breaker != nil && s.breaker.isOpen()
+	return s.breaker != nil && s.breaker.isSuspended()
 }
 
 // Stop signals the pipeline to drain and waits (bounded by ctx).

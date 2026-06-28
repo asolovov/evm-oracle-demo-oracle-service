@@ -260,6 +260,7 @@ func (s *Submitter) send(st *signedTx) {
 
 	n := len(s.broadcasters)
 	var lastFunds string
+	nonFundsSkip := false
 	for i := 0; i < n; i++ {
 		addr := s.broadcasters[(s.nextBroadcaster+i)%n]
 
@@ -272,7 +273,10 @@ func (s *Submitter) send(st *signedTx) {
 
 		auth, err := s.signer.NewBroadcasterFor(addr)
 		if err != nil {
-			// This wallet is misconfigured; try the next rather than stalling.
+			// This wallet is misconfigured (NOT a funds problem); try the next
+			// rather than stalling, and remember it so an all-misconfigured pool
+			// isn't misreported as a funds drain.
+			nonFundsSkip = true
 			log.WithError(err).WithField("broadcaster", addr.Hex()).Warn("build transactor; skipping wallet")
 			continue
 		}
@@ -286,9 +290,17 @@ func (s *Submitter) send(st *signedTx) {
 				// failover is pointless. Mark FAILED; no nonce consumed.
 				s.senderFail(item, st.price.String(), "broadcast reverted: "+err.Error())
 				return
+			case chainpkg.IsGasAllowanceError(err) && s.canAfford(ctx, addr, gas):
+				// "gas required exceeds allowance" on a wallet that PASSES the
+				// balance check is NOT a drain — it's an ambiguous estimator /
+				// out-of-gas transient. Don't fail over or trip the breaker;
+				// retry the whole item. Nonce NOT consumed.
+				s.retryOrExpire(item, "broadcast fulfillPrice ("+addr.Hex()+"): "+err.Error())
+				return
 			case chainpkg.IsInsufficientFundsError(err):
-				// THIS wallet can't pay — fail over to the next one. The wallet's
-				// nonce is untouched (no tx landed).
+				// THIS wallet can't pay (authoritative node rejection, or an
+				// allowance error corroborated by a failing balance check) —
+				// fail over to the next. The wallet's nonce is untouched.
 				lastFunds = err.Error()
 				log.WithField("broadcaster", addr.Hex()).Warn("broadcaster funds exhausted; failing over to next wallet")
 				continue
@@ -325,8 +337,16 @@ func (s *Submitter) send(st *signedTx) {
 		return
 	}
 
-	// Exhausted the whole pool — no wallet could pay. Raise the funds-failure
-	// event now (and only now), trip the breaker, and requeue within TTL.
+	// Exhausted the whole pool with no successful broadcast.
+	if lastFunds == "" && nonFundsSkip {
+		// Nothing was funds-blocked — every payable wallet failed to build a
+		// transactor (config error). Retry the item; do NOT trip the funds
+		// breaker or pause heartbeats for what isn't a funds problem.
+		s.retryOrExpire(item, "no usable broadcaster: build transactor failed for all wallets")
+		return
+	}
+	// At least one wallet was funds-blocked and none could pay: raise the
+	// funds-failure event now (and only now), trip the breaker, requeue in TTL.
 	s.allWalletsDrained(item, lastFunds)
 }
 

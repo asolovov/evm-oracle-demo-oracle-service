@@ -74,6 +74,19 @@ func TestIsInsufficientFundsError(t *testing.T) {
 	}
 }
 
+func TestIsGasAllowanceError(t *testing.T) {
+	if !IsGasAllowanceError(errors.New("gas required exceeds allowance (7800)")) {
+		t.Fatal("should match the estimator-ceiling string")
+	}
+	// The authoritative node funds rejection is NOT the allowance string.
+	if IsGasAllowanceError(errors.New("insufficient funds for transfer")) {
+		t.Fatal("node insufficient-funds is not the allowance error")
+	}
+	if IsGasAllowanceError(errors.New("execution reverted")) || IsGasAllowanceError(nil) {
+		t.Fatal("revert/nil must not match")
+	}
+}
+
 func TestScaleBigInt(t *testing.T) {
 	cases := []struct {
 		name string

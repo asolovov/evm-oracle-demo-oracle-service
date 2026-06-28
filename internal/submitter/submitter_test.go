@@ -101,6 +101,10 @@ type fakeChain struct {
 	// map (or missing key) => defaultBalance (effectively unlimited).
 	balances       map[common.Address]*big.Int
 	defaultBalance *big.Int
+	// onSubmit, if set, runs at the top of SubmitFulfillment and lets a test
+	// inject a per-wallet send error (e.g. funds error from the node itself,
+	// independent of the balance gate). Returning nil falls through to success.
+	onSubmit func(from common.Address) error
 }
 
 func newFakeChain() *fakeChain {
@@ -119,6 +123,14 @@ func (c *fakeChain) NonceAt(_ context.Context, _ common.Address) (uint64, error)
 }
 func (c *fakeChain) SubmitFulfillment(_ context.Context, auth *bind.TransactOpts,
 	_ common.Address, _, _, _ *big.Int, _ [][]byte, _ chainpkg.GasStrategy) (common.Hash, error) {
+	// onSubmit is set once before Start (no concurrent write) and may inject a
+	// per-wallet error; called outside the lock so the closure can use its own
+	// synchronization without contending on c.mu.
+	if c.onSubmit != nil {
+		if err := c.onSubmit(auth.From); err != nil {
+			return common.Hash{}, err
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.submitErr != nil {
@@ -692,6 +704,98 @@ func TestRevertDoesNotFailover(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	if s.BroadcastSuspended() {
 		t.Fatal("a revert must not trip the funds breaker")
+	}
+}
+
+// TestFundsErrorFromSubmitFailsOver: wallet A PASSES the balance gate but its
+// broadcast is rejected by the node with an authoritative `insufficient funds`
+// — the send must fail over to B (no balance corroboration needed for the
+// node's own funds rejection).
+func TestFundsErrorFromSubmitFailsOver(t *testing.T) {
+	fc, fp, fr := newFakeChain(), newFakePrice(), newFakeRepo()
+	fc.seedNonce = 70
+	fp.set("weth", &priceBehavior{median: 3450})
+	fc.onSubmit = func(from common.Address) error {
+		if from == walletA {
+			return errors.New("insufficient funds for transfer")
+		}
+		return nil
+	}
+	s := newSubmitterWithSigner(t, fc, fp, fr, time.Minute, newFakeSigner(walletA, walletB))
+	startSubmitter(t, s)
+
+	if err := s.HandleEvent(context.Background(), priceRequested(aggWETH, "1")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return fr.byAssetStatus("weth", models.SubmissionStatusConfirmed) == 1 })
+
+	from := fc.recordedFrom()
+	if len(from) != 1 || from[0] != walletB {
+		t.Fatalf("expected failover to walletB, got %v", from)
+	}
+	if s.BroadcastSuspended() {
+		t.Fatal("a single-wallet funds failover must not suspend broadcasting")
+	}
+}
+
+// TestGasAllowanceOnFundedWalletRetries: a wallet that PASSES the balance gate
+// but returns the ambiguous `gas required exceeds allowance` must be treated as
+// a transient (retry the item), NOT a drain — no failover, no breaker trip.
+func TestGasAllowanceOnFundedWalletRetries(t *testing.T) {
+	fc, fp, fr := newFakeChain(), newFakePrice(), newFakeRepo()
+	fp.set("weth", &priceBehavior{median: 3450})
+	var calls atomic.Int64
+	fc.onSubmit = func(_ common.Address) error {
+		if calls.Add(1) <= 2 { // fail the first two attempts, then succeed
+			return errors.New("gas required exceeds allowance (7800)")
+		}
+		return nil
+	}
+	s := newSubmitterWithSigner(t, fc, fp, fr, 5*time.Second, newFakeSigner(walletA),
+		WithFundsMetrics(func() { t.Error("funds-blocked must NOT fire for a funded wallet's allowance error") }, nil),
+	)
+	startSubmitter(t, s)
+
+	if err := s.HandleEvent(context.Background(), priceRequested(aggWETH, "1")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	waitFor(t, 4*time.Second, func() bool { return fr.byAssetStatus("weth", models.SubmissionStatusConfirmed) == 1 })
+	if s.BroadcastSuspended() {
+		t.Fatal("allowance error on a funded wallet must not suspend broadcasting")
+	}
+}
+
+// TestBreakerUnsuspendsOnProbe is the B1 regression. Once the breaker is open,
+// recovery must come from the balance PROBE un-suspending (moving to half-open)
+// — NOT from a successful send. Here every broadcast keeps failing with a
+// NON-funds transient even after the wallet is refunded, so the only way the
+// breaker can un-suspend is the probe. The buggy version left half-open
+// suspended, pinning the gauge at 1 and pausing heartbeats forever.
+func TestBreakerUnsuspendsOnProbe(t *testing.T) {
+	fc, fp, fr := newFakeChain(), newFakePrice(), newFakeRepo()
+	fp.set("weth", &priceBehavior{median: 3450})
+	fc.setBalance(walletA, big.NewInt(0)) // drained → gate fails → breaker opens
+	// Sends always fail with a non-funds transient, so recovery can ONLY come
+	// from the probe un-suspending half-open, never from a successful send.
+	fc.onSubmit = func(_ common.Address) error { return errors.New("connection refused") }
+
+	s := newSubmitterWithSigner(t, fc, fp, fr, 30*time.Second, newFakeSigner(walletA))
+	startSubmitter(t, s)
+
+	if err := s.HandleEvent(context.Background(), priceRequested(aggWETH, "1")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return s.BroadcastSuspended() })
+
+	// Refund: the probe must un-suspend even though sends keep failing.
+	fc.setBalance(walletA, gateFloor())
+	waitFor(t, 2*time.Second, func() bool { return !s.BroadcastSuspended() })
+
+	// And it must STAY un-suspended — a non-funds transient on a funded wallet
+	// must not re-trip the funds breaker.
+	time.Sleep(300 * time.Millisecond)
+	if s.BroadcastSuspended() {
+		t.Fatal("funded wallet with a non-funds transient must not re-suspend the funds breaker")
 	}
 }
 
