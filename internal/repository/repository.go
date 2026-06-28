@@ -53,7 +53,7 @@ type Repository interface {
 	ExpireOverdue(ctx context.Context) (int, error)
 
 	// Pending tx tracking (restart resilience).
-	InsertPendingTx(ctx context.Context, submissionID int64, txHash string, nonce uint64, gasStrategyJSON []byte) error
+	InsertPendingTx(ctx context.Context, submissionID int64, txHash string, nonce uint64, broadcaster string, gasStrategyJSON []byte) error
 	ListPendingByTxHash(ctx context.Context, txHash string) ([]PendingTx, error)
 	DeletePendingTx(ctx context.Context, txHash string) error
 	ListAllPendingTx(ctx context.Context) ([]PendingTx, error)
@@ -141,8 +141,8 @@ func (r *PgxRepository) Ping(ctx context.Context) error {
 const insertSubmissionSQL = `
 INSERT INTO oracle_submissions (req_id, asset_id, aggregator, tx_hash,
                                 submitted_price, submitted_at, status,
-                                retry_count, last_error)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                retry_count, last_error, broadcaster)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING id`
 
 // InsertSubmission persists a new submission row and returns its DB id.
@@ -158,6 +158,7 @@ func (r *PgxRepository) InsertSubmission(ctx context.Context, s *models.Submissi
 		s.Status.String(),
 		s.RetryCount,
 		s.LastError,
+		addrStr(s.Broadcaster),
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("insert submission: %w", err)
@@ -174,6 +175,9 @@ SET    tx_hash         = $2,
        status          = $5,
        retry_count     = $6,
        last_error      = $7,
+       -- Preserve a previously-recorded broadcaster when this update doesn't
+       -- carry one (status-only transitions like queued->sending, finalize).
+       broadcaster     = COALESCE(NULLIF($8, ''), broadcaster),
        updated_at      = now()
 WHERE  id = $1`
 
@@ -187,6 +191,7 @@ func (r *PgxRepository) UpdateSubmission(ctx context.Context, s *models.Submissi
 		s.Status.String(),
 		s.RetryCount,
 		s.LastError,
+		addrStr(s.Broadcaster),
 	)
 	if err != nil {
 		return fmt.Errorf("update submission: %w", err)
@@ -404,13 +409,16 @@ func (r *PgxRepository) ExpireOverdue(ctx context.Context) (int, error) {
 // ---------------------------------------------------------------------------
 
 const insertPendingTxSQL = `
-INSERT INTO pending_txs (submission_id, tx_hash, nonce, gas_strategy_json)
-VALUES ($1, $2, $3, COALESCE($4::jsonb, '{}'::jsonb))`
+INSERT INTO pending_txs (submission_id, tx_hash, nonce, gas_strategy_json, broadcaster)
+VALUES ($1, $2, $3, COALESCE($4::jsonb, '{}'::jsonb), $5)`
 
-// InsertPendingTx records an in-flight tx so a restart can resume reconciliation.
-func (r *PgxRepository) InsertPendingTx(ctx context.Context, submissionID int64, txHash string, nonce uint64, gasStrategyJSON []byte) error {
+// InsertPendingTx records an in-flight tx so a restart can resume
+// reconciliation. broadcaster is the wallet whose nonce the tx consumed
+// (task 06.3) — recorded so a future recovery can replace-by-fee from the
+// same wallet+nonce.
+func (r *PgxRepository) InsertPendingTx(ctx context.Context, submissionID int64, txHash string, nonce uint64, broadcaster string, gasStrategyJSON []byte) error {
 	//nolint:gosec // nonce comes from chain client and fits int64 in practice
-	_, err := r.pool.Exec(ctx, insertPendingTxSQL, submissionID, txHash, int64(nonce), gasStrategyJSON)
+	_, err := r.pool.Exec(ctx, insertPendingTxSQL, submissionID, txHash, int64(nonce), gasStrategyJSON, broadcaster)
 	if err != nil {
 		return fmt.Errorf("insert pending tx: %w", err)
 	}
@@ -630,6 +638,15 @@ func txHashStr(h common.Hash) string {
 		return ""
 	}
 	return h.Hex()
+}
+
+// addrStr maps the zero address to an empty string so an un-broadcast row
+// stores "" rather than the all-zero address in broadcaster.
+func addrStr(a common.Address) string {
+	if (a == common.Address{}) {
+		return ""
+	}
+	return a.Hex()
 }
 
 // nullableStr maps an empty string to a SQL NULL so a price-less `queued` row

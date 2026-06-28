@@ -238,7 +238,7 @@ func TestIntegration_PendingTxRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if err := repo.InsertPendingTx(ctx, id, "0xab", 5, []byte(`{"k":"v"}`)); err != nil {
+	if err := repo.InsertPendingTx(ctx, id, "0xab", 5, "0x00000000000000000000000000000000000000Bb", []byte(`{"k":"v"}`)); err != nil {
 		t.Fatalf("insert pending: %v", err)
 	}
 

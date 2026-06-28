@@ -3,15 +3,17 @@
 > **This is a portfolio demo. It is not a production oracle.** Read this whole
 > file before deploying anywhere that touches real funds.
 
-## Operational pre-requisite: fund the broadcaster wallet
+## Operational pre-requisite: fund the broadcaster wallets
 
-The chain client reuses **reporter\[0\]** (the first address in `SIGNER_REPORTER_KEY_PATHS`) as the broadcaster EOA for every `fulfillPrice` transaction. The on-chain contract does not gate `msg.sender` — the M-of-N digest signatures are the sole authorisation — so reusing one of the reporter keys for broadcast keeps the demo at three funded wallets instead of four.
+The submitter broadcasts `fulfillPrice` transactions from a **pool** of EOAs — by default the full reporter set (`SIGNER_REPORTER_KEY_PATHS`). The on-chain contract does not gate `msg.sender` — the M-of-N digest signatures are the sole authorisation — so any funded EOA can broadcast, and reusing the reporter keys keeps the demo at three funded wallets instead of six.
 
-**Consequence: reporter\[0\] must hold gas-bearing native balance on the target chain at all times.** If it doesn't, every PriceRequested event hits go-ethereum's pre-broadcast funds check with `insufficient funds for transfer`, and the stream consumer logs a reconnect-retry loop until the wallet is topped up.
+**Multi-wallet rotation + failover (task 06.3).** The single sender goroutine rotates across the pool round-robin, each wallet carrying its own nonce counter. If a wallet can't pay, the send **fails over to the next wallet** — draining one wallet no longer stalls the oracle. A submission is only ever considered funds-blocked **after every wallet in the pool has been tried and refused**.
 
-Recommended floor on Sepolia: **≥ 0.1 ETH** (each `fulfillPrice` is ~150k gas; 0.1 ETH covers thousands of submissions at Sepolia base-fee). The `oracle_reporter_balance_eth{address}` Prometheus gauge is read once at startup — alert on it being below the floor.
+**Funds-awareness + circuit breaker (task 06.2).** Before each broadcast a pre-flight balance gate skips a wallet that demonstrably can't cover `maxFeePerGas × SUBMISSION_GAS_LIMIT_ESTIMATE`, so a drained wallet doesn't even burn an `eth_estimateGas` call. When **all** wallets are drained the breaker trips **open**: broadcasting suspends, the heartbeat scheduler pauses, and a balance probe runs on exponential backoff (`SUBMISSION_BREAKER_BACKOFF_MIN_SEC` → `…_MAX_SEC`). Refunding any wallet closes the breaker and resumes automatically. This replaces the previous failure mode where a drained reporter\[0\] caused an infinite `gas required exceeds allowance` / `insufficient funds` retry storm against the RPC.
 
-The other reporters (reporter\[1\], reporter\[2\]) only sign digests off-chain and do not need any balance.
+Recommended floor on Sepolia: **≥ 0.1 ETH per wallet** (each `fulfillPrice` is ~150k gas; 0.1 ETH covers thousands of submissions at Sepolia base-fee). The `oracle_reporter_balance_eth{address}` Prometheus gauge is refreshed continuously (every 30s, not just at startup) for **every** pool wallet — alert on any falling below the floor, and on `oracle_circuit_breaker_open == 1` / `oracle_broadcaster_funds_blocked_total` increasing.
+
+If you decouple broadcasting from signing (a future `SIGNER_BROADCASTER_KEY_PATHS`), only the broadcaster wallets need balance; pure signers do not.
 
 ## Threat model in scope
 
@@ -34,6 +36,7 @@ Concretely: if an attacker reads two of `reporter{1,2,3}.json` off disk, they ca
 | Idempotency scope | `repository.ExistsForAggregatorReqID(aggregator, req_id)` is the streamconsumer's per-event check. **Scope is `(aggregator, req_id)`, NOT `req_id` alone** — each PriceAggregator owns its own req_id counter starting at 1, so the same numeric req_id legitimately exists across all 10 aggregators. The original scope (req_id alone) silently dropped 7 of 8 sibling-asset events when one had already been recorded. | Same shape. |
 | Replace-by-fee | Same nonce + gas bump on `SUBMISSION_REPLACE_AFTER_SEC` elapsed; max 3 retries then `STATUS_DROPPED`. | Tighter operator monitoring; alert on `oracle_submissions_total{status=\"dropped\"}` > 0. |
 | Async pipeline + request TTL (task 06.1) | Requests are processed asynchronously by a worker pool (`SUBMISSION_WORKERS`); one un-priceable asset can't block others. The single sender goroutine serializes the broadcaster nonce (the only ordered stage). A request not fulfilled within `SUBMISSION_REQUEST_TTL_SEC` is marked terminal `STATUS_EXPIRED` — **pre-broadcast only**, so a nonce is never consumed-then-abandoned (no nonce-gap stall). Durable `queued`/`processing`/`sending` rows are re-enqueued on restart. | Same shape. Alert on `oracle_requests_expired_total` (assets that repeatedly can't be priced) and watch `oracle_request_processing_duration_seconds`. Multi-instance would need a `FOR UPDATE SKIP LOCKED` claim instead of in-memory dispatch. |
+| Multi-wallet broadcaster + funds breaker (task 06.2 / 06.3) | The sender rotates across a pool of broadcaster EOAs (the reporter set) with **per-wallet nonce counters** and round-robin selection. A pre-flight balance gate + `insufficient funds` / `gas required exceeds allowance` classification route a drained wallet to **failover**, not retry. The funds-blocked event + circuit breaker fire **only after every wallet is exhausted**; the breaker then suspends broadcasting + pauses heartbeats and auto-recovers via a balance probe on backoff. Funds shortage is recoverable, so the request is NOT marked `STATUS_FAILED` — it stays queued within its TTL. The `broadcaster` column records which wallet+nonce sent each tx (for replace-by-fee + ops; restart reconciliation of in-flight `pending` rows remains the documented v1 gap). | Same shape. Decouple broadcaster keys from signer keys; per-wallet alerting; consider highest-balance-first selection and KMS-backed transactors. |
 
 ## What the on-chain contract checks (independent of this service)
 
@@ -53,7 +56,9 @@ If you re-deploy contracts you MUST also re-roll the reporter set so old leaked 
   - `oracle_submissions_total{status=\"dropped\"}` > 0 (replace-by-fee exhausted).
   - `oracle_stream_lag_seconds` > 30s sustained (indexer falling behind).
   - `oracle_stream_reconnect_total` rate spike (connectivity issues).
-  - `oracle_reporter_balance_eth{address}` < threshold (refill needed).
+  - `oracle_reporter_balance_eth{address}` < threshold (refill needed; refreshed every 30s).
+  - `oracle_circuit_breaker_open == 1` (ALL broadcaster wallets drained — broadcasting suspended).
+  - `oracle_broadcaster_funds_blocked_total` increasing (a submission exhausted the whole pool on funds).
 - Logs are JSON when `TELEMETRY_LOG_FORMAT=json`. Reporter addresses are logged; reporter private keys are NEVER logged.
 
 ## Disclosure

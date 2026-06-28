@@ -59,6 +59,9 @@ type ChainClient interface {
 		signatures [][]byte, gas chainpkg.GasStrategy) (common.Hash, error)
 	TxReceipt(ctx context.Context, hash common.Hash) (*types.Receipt, error)
 	LatestStartedAt(ctx context.Context, aggregator common.Address) (*big.Int, error)
+	// BalanceAt backs the pre-flight balance gate (task 06.2): the sender skips
+	// a wallet that demonstrably can't pay before burning an estimateGas call.
+	BalanceAt(ctx context.Context, addr common.Address) (*big.Int, error)
 }
 
 // PriceClient is the price-service gRPC surface.
@@ -70,8 +73,11 @@ type PriceClient interface {
 type SignerClient interface {
 	BuildDigest(reqID *big.Int, assetID common.Hash, price, timestamp *big.Int, aggregator common.Address) ([]byte, error)
 	Sign(digest []byte) ([][]byte, error)
-	NewBroadcaster() (*bind.TransactOpts, error)
-	BroadcasterAddress() common.Address
+	// Broadcasters is the pool of EOAs the sender rotates across + fails over
+	// between (task 06.3). NewBroadcasterFor builds a transactor for a chosen
+	// pool wallet.
+	Broadcasters() []common.Address
+	NewBroadcasterFor(addr common.Address) (*bind.TransactOpts, error)
 }
 
 // Repo is the repository surface the submitter needs.
@@ -82,7 +88,7 @@ type Repo interface {
 	MarkExpired(ctx context.Context, id int64, lastErr string) error
 	LoadResumable(ctx context.Context) ([]*models.Submission, error)
 	ExpireOverdue(ctx context.Context) (int, error)
-	InsertPendingTx(ctx context.Context, submissionID int64, txHash string, nonce uint64, gasStrategyJSON []byte) error
+	InsertPendingTx(ctx context.Context, submissionID int64, txHash string, nonce uint64, broadcaster string, gasStrategyJSON []byte) error
 	DeletePendingTx(ctx context.Context, txHash string) error
 }
 
@@ -121,25 +127,35 @@ type Submitter struct {
 
 	log *logrus.Entry
 
-	workers      int
-	ttl          time.Duration
-	pollEvery    time.Duration
-	retryBackoff time.Duration // base unit; backoff = retryBackoff*attempts, capped
+	workers          int
+	ttl              time.Duration
+	pollEvery        time.Duration
+	retryBackoff     time.Duration // base unit; backoff = retryBackoff*attempts, capped
+	gasLimitEstimate uint64        // assumed fulfillPrice gas limit for the balance gate
 
 	requests chan *workItem
 	sendCh   chan *signedTx
-	nonce    uint64 // owned exclusively by the single sender goroutine; no lock
+
+	// Broadcaster pool (task 06.3). All owned exclusively by the single sender
+	// goroutine — no lock. nonces tracks a per-wallet counter; nextBroadcaster
+	// is the round-robin cursor; breaker trips only when EVERY wallet drains.
+	broadcasters    []common.Address
+	nonces          map[common.Address]uint64
+	nextBroadcaster int
+	breaker         *breaker
 
 	wg       sync.WaitGroup
 	stop     chan struct{}
 	stopOnce sync.Once
 
 	// Metrics hooks (nil-tolerant).
-	onSubmission func(asset, status string)
-	onGasUsed    func(uint64)
-	onQueued     func()
-	onExpired    func(asset string)
-	onProcessing func(seconds float64)
+	onSubmission   func(asset, status string)
+	onGasUsed      func(uint64)
+	onQueued       func()
+	onExpired      func(asset string)
+	onProcessing   func(seconds float64)
+	onFundsBlocked func()
+	onBreaker      func(open bool)
 }
 
 // Option tunes the Submitter at construction time.
@@ -167,6 +183,16 @@ func WithQueueMetrics(onQueued func(), onExpired func(asset string), onProcessin
 	}
 }
 
+// WithFundsMetrics wires the funds-awareness/circuit-breaker metrics (task 06.2):
+// onFundsBlocked increments when a send exhausts every wallet, onBreaker sets
+// the open/closed gauge. Nil hooks ignored.
+func WithFundsMetrics(onFundsBlocked func(), onBreaker func(open bool)) Option {
+	return func(s *Submitter) {
+		s.onFundsBlocked = onFundsBlocked
+		s.onBreaker = onBreaker
+	}
+}
+
 // WithPollInterval overrides the receipt-poll cadence. Used by tests.
 func WithPollInterval(d time.Duration) Option {
 	return func(s *Submitter) { s.pollEvery = d }
@@ -176,6 +202,12 @@ func WithPollInterval(d time.Duration) Option {
 // to keep TTL/retry assertions fast.
 func WithRetryBackoff(d time.Duration) Option {
 	return func(s *Submitter) { s.retryBackoff = d }
+}
+
+// WithBreakerBackoff overrides the circuit-breaker probe backoff bounds. Used
+// by tests to drive sub-second breaker recovery (config is seconds-granular).
+func WithBreakerBackoff(minBackoff, maxBackoff time.Duration) Option {
+	return func(s *Submitter) { s.breaker = newBreaker(minBackoff, maxBackoff) }
 }
 
 // New constructs a Submitter. Call Start to launch the worker pool + sender.
@@ -202,6 +234,10 @@ func New(c ChainClient, p PriceClient, sgn SignerClient, repo Repo,
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
+	gasLimitEstimate := cfg.GasLimitEstimate
+	if gasLimitEstimate == 0 {
+		gasLimitEstimate = 300_000
+	}
 
 	sub := &Submitter{
 		chain: c, price: p, signer: sgn, repo: repo,
@@ -212,10 +248,17 @@ func New(c ChainClient, p PriceClient, sgn SignerClient, repo Repo,
 		ttl:                 ttl,
 		pollEvery:           5 * time.Second,
 		retryBackoff:        2 * time.Second,
-		requests:            make(chan *workItem, workers*8),
-		sendCh:              make(chan *signedTx, workers*2),
-		stop:                make(chan struct{}),
-		log:                 logrus.NewEntry(logrus.StandardLogger()).WithField("component", "submitter"),
+		gasLimitEstimate:    gasLimitEstimate,
+		broadcasters:        sgn.Broadcasters(),
+		nonces:              make(map[common.Address]uint64),
+		breaker: newBreaker(
+			time.Duration(cfg.BreakerBackoffMinSec)*time.Second,
+			time.Duration(cfg.BreakerBackoffMaxSec)*time.Second,
+		),
+		requests: make(chan *workItem, workers*8),
+		sendCh:   make(chan *signedTx, workers*2),
+		stop:     make(chan struct{}),
+		log:      logrus.NewEntry(logrus.StandardLogger()).WithField("component", "submitter"),
 	}
 	for _, opt := range opts {
 		opt(sub)
@@ -223,17 +266,46 @@ func New(c ChainClient, p PriceClient, sgn SignerClient, repo Repo,
 	return sub
 }
 
-// Start seeds the sender's nonce, launches the sender + worker pool, and runs
-// startup recovery (re-enqueue durable non-terminal rows; expire the overdue).
+// Start seeds a per-wallet nonce for every broadcaster, wires the breaker's
+// transition hooks, launches the sender + worker pool, and runs startup
+// recovery (re-enqueue durable non-terminal rows; expire the overdue).
 func (s *Submitter) Start(ctx context.Context) error {
-	n, err := s.chain.NonceAt(ctx, s.signer.BroadcasterAddress())
-	if err != nil {
-		return fmt.Errorf("seed broadcaster nonce: %w", err)
+	if len(s.broadcasters) == 0 {
+		return fmt.Errorf("no broadcaster wallets configured")
 	}
-	s.nonce = n
+	seeds := make(map[string]uint64, len(s.broadcasters))
+	for _, addr := range s.broadcasters {
+		n, err := s.chain.NonceAt(ctx, addr)
+		if err != nil {
+			return fmt.Errorf("seed nonce for broadcaster %s: %w", addr.Hex(), err)
+		}
+		s.nonces[addr] = n
+		seeds[addr.Hex()] = n
+	}
+
+	// Breaker transition hooks: fire the funds-exhausted event + flip the gauge
+	// exactly once per transition (not per attempt).
+	s.breaker.onOpen = func() {
+		if s.onFundsBlocked != nil {
+			s.onFundsBlocked()
+		}
+		if s.onBreaker != nil {
+			s.onBreaker(true)
+		}
+		s.log.Error("ALL broadcaster wallets drained — broadcasting suspended; will probe for refunded wallet on backoff")
+	}
+	s.breaker.onClose = func() {
+		if s.onBreaker != nil {
+			s.onBreaker(false)
+		}
+		s.log.Info("broadcaster wallet funded again — broadcasting resumed")
+	}
 
 	s.wg.Add(1)
-	go s.runSender()
+	// The sender owns its lifecycle via s.stop, NOT the Start ctx — Background
+	// is intentional so an in-flight broadcast/probe isn't hard-canceled on
+	// shutdown; draining is signaled through s.stop instead.
+	go s.runSender() //nolint:gosec // G118: deliberate — lifecycle is s.stop, see above
 
 	for i := 0; i < s.workers; i++ {
 		s.wg.Add(1)
@@ -241,9 +313,20 @@ func (s *Submitter) Start(ctx context.Context) error {
 	}
 
 	s.recover(ctx)
-	s.log.WithFields(logrus.Fields{"workers": s.workers, "ttl": s.ttl.String(), "nonce": n}).
-		Info("submitter pipeline started")
+	s.log.WithFields(logrus.Fields{
+		"workers":      s.workers,
+		"ttl":          s.ttl.String(),
+		"broadcasters": len(s.broadcasters),
+		"seed_nonces":  seeds, // snapshot — never the live s.nonces map (sender mutates it)
+	}).Info("submitter pipeline started")
 	return nil
+}
+
+// BroadcastSuspended reports whether the circuit breaker is open (every
+// broadcaster wallet is drained). The heartbeat scheduler consults this to
+// pause firing instead of enqueuing doomed work every tick (task 06.2).
+func (s *Submitter) BroadcastSuspended() bool {
+	return s.breaker != nil && s.breaker.isOpen()
 }
 
 // Stop signals the pipeline to drain and waits (bounded by ctx).

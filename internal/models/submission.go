@@ -36,6 +36,11 @@ type Submission struct {
 	// ExpiresAt is the TTL deadline for a queued request (task 06.1). Zero for
 	// heartbeat submissions (which bypass the queue) and for terminal rows.
 	ExpiresAt time.Time
+
+	// Broadcaster is the EOA that broadcast this submission's tx (task 06.3).
+	// Zero until the sender picks a wallet from the pool. Recorded so
+	// replace-by-fee + ops can attribute a tx to its wallet+nonce.
+	Broadcaster common.Address
 }
 
 // ToProto produces the wire form for ListSubmissions / GetSubmissionStatus.

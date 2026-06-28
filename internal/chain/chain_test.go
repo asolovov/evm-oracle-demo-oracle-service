@@ -40,6 +40,40 @@ func TestIsRevertError(t *testing.T) {
 	}
 }
 
+func TestIsInsufficientFundsError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// Funds — broadcast-time (node rejects signed tx).
+		{"core ErrInsufficientFunds", errors.New("insufficient funds for gas * price + value"), true},
+		{"insufficient funds for transfer", errors.New("insufficient funds for transfer"), true},
+		{"wrapped funds", fmt.Errorf("broadcast fulfillPrice: %w", errors.New("insufficient funds for gas * price + value")), true},
+		// Funds — client-side estimateGas ceiling collapse on a drained wallet.
+		{"gas required exceeds allowance", errors.New("gas required exceeds allowance (7800)"), true},
+		{"mixed case", errors.New("Insufficient Funds for gas"), true},
+
+		// NOT funds — must stay out of the funds class.
+		{"plain revert", errors.New("execution reverted"), false},
+		{"contract InsufficientFee custom error", errors.New("execution reverted: InsufficientFee"), false},
+		{"contract InsufficientSignatures", errors.New("execution reverted: InsufficientSignatures"), false},
+		{"connection refused", errors.New("dial tcp: connection refused"), false},
+		{"nonce too low", errors.New("nonce too low"), false},
+
+		// Edge.
+		{"nil", nil, false},
+		{"empty", errors.New(""), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := IsInsufficientFundsError(c.err); got != c.want {
+				t.Fatalf("IsInsufficientFundsError(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
 func TestScaleBigInt(t *testing.T) {
 	cases := []struct {
 		name string

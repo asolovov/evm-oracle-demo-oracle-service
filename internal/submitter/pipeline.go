@@ -216,6 +216,24 @@ func (s *Submitter) markStatus(ctx context.Context, item *workItem, st models.Su
 func (s *Submitter) runSender() {
 	defer s.wg.Done()
 	for {
+		// While the breaker is open EVERY wallet is drained, so holding here is
+		// what replaces the old infinite retry/RPC-storm: don't pull new work,
+		// wait the backoff, then probe for a refunded wallet. A good probe →
+		// half-open, and we fall through so the next send is the recovery trial.
+		if s.breaker.state == breakerOpen {
+			select {
+			case <-s.stop:
+				return
+			case <-time.After(s.breaker.curBackoff):
+			}
+			if s.anyWalletCanAfford(context.Background()) {
+				s.breaker.toHalfOpen()
+			} else {
+				s.breaker.growBackoff()
+				continue
+			}
+		}
+
 		select {
 		case <-s.stop:
 			return
@@ -225,52 +243,140 @@ func (s *Submitter) runSender() {
 	}
 }
 
+// send broadcasts one signed payload, rotating across the broadcaster pool and
+// failing over wallet-by-wallet. The funds-failure event is raised ONLY after
+// every wallet has been tried and refused — never on the first drained wallet.
 func (s *Submitter) send(st *signedTx) {
 	ctx := context.Background()
 	item := st.item
 	log := s.itemLog(item)
 
-	auth, err := s.signer.NewBroadcaster()
-	if err != nil {
-		s.retryOrExpire(item, "build transactor opts: "+err.Error())
-		return
-	}
-	auth.Nonce = new(big.Int).SetUint64(s.nonce)
-
 	gas, err := s.chain.SuggestGas(ctx, 0)
 	if err != nil {
-		// Transient; nonce NOT consumed.
+		// Transient; no nonce consumed.
 		s.retryOrExpire(item, "suggest gas: "+err.Error())
 		return
 	}
 
-	txHash, err := s.chain.SubmitFulfillment(ctx, auth, item.aggregator, item.reqID, st.price, st.ts, st.sigs, gas)
-	if err != nil {
-		if chainpkg.IsRevertError(err) {
-			// Permanent — estimate/sim reverted; nonce NOT consumed.
-			s.senderFail(item, st.price.String(), "broadcast reverted: "+err.Error())
-			return
+	n := len(s.broadcasters)
+	var lastFunds string
+	for i := 0; i < n; i++ {
+		addr := s.broadcasters[(s.nextBroadcaster+i)%n]
+
+		// Pre-flight balance gate: skip a wallet that demonstrably can't pay,
+		// before burning an estimateGas call on it (task 06.2).
+		if !s.canAfford(ctx, addr, gas) {
+			lastFunds = "wallet " + addr.Hex() + " below balance gate"
+			continue
 		}
-		// Transient (RPC/funds/nonce race); nonce NOT consumed → reused next.
-		s.retryOrExpire(item, "broadcast fulfillPrice: "+err.Error())
+
+		auth, err := s.signer.NewBroadcasterFor(addr)
+		if err != nil {
+			// This wallet is misconfigured; try the next rather than stalling.
+			log.WithError(err).WithField("broadcaster", addr.Hex()).Warn("build transactor; skipping wallet")
+			continue
+		}
+		auth.Nonce = new(big.Int).SetUint64(s.nonces[addr])
+
+		txHash, err := s.chain.SubmitFulfillment(ctx, auth, item.aggregator, item.reqID, st.price, st.ts, st.sigs, gas)
+		if err != nil {
+			switch {
+			case chainpkg.IsRevertError(err):
+				// Permanent — the same calldata reverts from ANY wallet, so
+				// failover is pointless. Mark FAILED; no nonce consumed.
+				s.senderFail(item, st.price.String(), "broadcast reverted: "+err.Error())
+				return
+			case chainpkg.IsInsufficientFundsError(err):
+				// THIS wallet can't pay — fail over to the next one. The wallet's
+				// nonce is untouched (no tx landed).
+				lastFunds = err.Error()
+				log.WithField("broadcaster", addr.Hex()).Warn("broadcaster funds exhausted; failing over to next wallet")
+				continue
+			default:
+				// Generic transient (RPC blip / nonce race): not a funds problem,
+				// so don't fail over — retry the whole item later. Nonce NOT
+				// consumed → reused on the next attempt.
+				s.retryOrExpire(item, "broadcast fulfillPrice ("+addr.Hex()+"): "+err.Error())
+				return
+			}
+		}
+
+		// Success — addr's nonce is consumed; advance it, rotate the cursor past
+		// this wallet (round-robin), and close the breaker.
+		nonceUsed := s.nonces[addr]
+		s.nonces[addr] = nonceUsed + 1
+		s.nextBroadcaster = (s.nextBroadcaster + i + 1) % n
+		s.breaker.recordSuccess()
+
+		sub := s.persistPending(ctx, item, st.price, txHash, nonceUsed, addr)
+		s.markSubmissionMetric(item.symbol, models.SubmissionStatusPending)
+		log.WithFields(logrus.Fields{"tx_hash": txHash.Hex(), "nonce": nonceUsed, "broadcaster": addr.Hex()}).
+			Info("fulfillPrice broadcast")
+
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			// Fresh context: the watcher must outlive the send call so an
+			// in-flight tx isn't stranded; it exits on s.stop. auth carries the
+			// broadcasting wallet + pinned nonce so replace-by-fee re-broadcasts
+			// from the same wallet+nonce.
+			s.watch(context.Background(), sub, auth, item.aggregator, st.price, st.ts, st.sigs)
+		}()
 		return
 	}
 
-	// Success — nonce consumed; advance the counter (single-goroutine, no lock).
-	nonceUsed := s.nonce
-	s.nonce++
+	// Exhausted the whole pool — no wallet could pay. Raise the funds-failure
+	// event now (and only now), trip the breaker, and requeue within TTL.
+	s.allWalletsDrained(item, lastFunds)
+}
 
-	sub := s.persistPending(ctx, item, st.price, txHash, nonceUsed)
-	s.markSubmissionMetric(item.symbol, models.SubmissionStatusPending)
-	log.WithFields(logrus.Fields{"tx_hash": txHash.Hex(), "nonce": nonceUsed}).Info("fulfillPrice broadcast")
+// allWalletsDrained handles the case where a send tried every broadcaster and
+// none could pay. Funds shortage is RECOVERABLE, so the request is NOT marked
+// terminally failed: the breaker trips (firing the single funds-exhausted
+// event + flipping the gauge) and the request is requeued within its TTL so it
+// resumes once a wallet is refunded. With the breaker open the sender holds, so
+// this does not spin the RPC.
+func (s *Submitter) allWalletsDrained(item *workItem, cause string) {
+	s.breaker.tripOpen()
+	msg := "all broadcaster wallets drained"
+	if cause != "" {
+		msg += ": " + cause
+	}
+	s.retryOrExpire(item, msg)
+}
 
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		// Fresh context: the watcher must outlive the send call so an
-		// in-flight tx isn't stranded; it exits on s.stop.
-		s.watch(context.Background(), sub, auth, item.aggregator, st.price, st.ts, st.sigs)
-	}()
+// canAfford reports whether addr can cover the worst-case tx cost
+// (gasFeeCap * the assumed fulfillPrice gas limit). SuggestGas leaves the real
+// GasLimit at 0, so the gate must use a configured estimate or it degenerates
+// to `balance >= 0`. A balance-read error is treated as indeterminate → allow
+// the attempt (the send itself surfaces a real funds error), so a transient RPC
+// blip cannot false-trip the breaker.
+func (s *Submitter) canAfford(ctx context.Context, addr common.Address, gas chainpkg.GasStrategy) bool {
+	if gas.GasFeeCap == nil {
+		return true
+	}
+	bal, err := s.chain.BalanceAt(ctx, addr)
+	if err != nil || bal == nil {
+		return true
+	}
+	need := new(big.Int).Mul(gas.GasFeeCap, new(big.Int).SetUint64(s.gasLimitEstimate))
+	return bal.Cmp(need) >= 0
+}
+
+// anyWalletCanAfford is the breaker's open-state probe: true if at least one
+// pool wallet now passes the balance gate. A SuggestGas failure means we can't
+// price the probe, so we stay cautious (remain open).
+func (s *Submitter) anyWalletCanAfford(ctx context.Context) bool {
+	gas, err := s.chain.SuggestGas(ctx, 0)
+	if err != nil {
+		return false
+	}
+	for _, addr := range s.broadcasters {
+		if s.canAfford(ctx, addr, gas) {
+			return true
+		}
+	}
+	return false
 }
 
 // senderFail marks a request terminally failed for a permanent on-chain revert
@@ -282,7 +388,7 @@ func (s *Submitter) senderFail(item *workItem, price, cause string) {
 // persistPending transitions a request to `pending` after a successful
 // broadcast: updates the queued row (consumer-driven) or inserts a fresh row
 // (heartbeat). Returns the submission with its id set, for the watcher.
-func (s *Submitter) persistPending(ctx context.Context, item *workItem, price *big.Int, txHash common.Hash, nonce uint64) *models.Submission {
+func (s *Submitter) persistPending(ctx context.Context, item *workItem, price *big.Int, txHash common.Hash, nonce uint64, broadcaster common.Address) *models.Submission {
 	sub := &models.Submission{
 		ID:             item.submissionID,
 		ReqID:          item.reqID.String(),
@@ -292,6 +398,7 @@ func (s *Submitter) persistPending(ctx context.Context, item *workItem, price *b
 		SubmittedPrice: price.String(),
 		SubmittedAt:    time.Now().UTC(),
 		Status:         models.SubmissionStatusPending,
+		Broadcaster:    broadcaster,
 	}
 	if item.submissionID != 0 {
 		if err := s.repo.UpdateSubmission(ctx, sub); err != nil {
@@ -305,7 +412,7 @@ func (s *Submitter) persistPending(ctx context.Context, item *workItem, price *b
 			sub.ID = id
 		}
 	}
-	if err := s.repo.InsertPendingTx(ctx, sub.ID, txHash.Hex(), nonce, nil); err != nil {
+	if err := s.repo.InsertPendingTx(ctx, sub.ID, txHash.Hex(), nonce, broadcaster.Hex(), nil); err != nil {
 		s.itemLog(item).WithError(err).Warn("persist pending tx (non-fatal)")
 	}
 	return sub
@@ -387,7 +494,7 @@ func (s *Submitter) watch(
 			log.WithError(uerr).Warn("update submission after replace")
 		}
 		_ = s.repo.DeletePendingTx(ctx, old.Hex())
-		_ = s.repo.InsertPendingTx(ctx, sub.ID, newHash.Hex(), auth.Nonce.Uint64(), nil)
+		_ = s.repo.InsertPendingTx(ctx, sub.ID, newHash.Hex(), auth.Nonce.Uint64(), auth.From.Hex(), nil)
 		lastBroadcast = time.Now()
 		log.WithFields(logrus.Fields{"old_tx": old.Hex(), "new_tx": newHash.Hex(), "retry": sub.RetryCount}).
 			Info("replace-by-fee submitted")
