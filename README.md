@@ -45,6 +45,15 @@ stream consumer ─▶ durably enqueue (queued row) + advance cursor immediately
 
 Single-instance design — dispatch is an in-memory channel (each request reaches exactly one worker) with the DB row for durability/observability/recovery; a multi-instance deployment would instead need a `FOR UPDATE SKIP LOCKED` claim.
 
+### Multi-wallet broadcaster + funds breaker (task 06.2 / 06.3)
+
+From a live prod incident: the sole broadcaster (reporter\[0\]) drained while two sibling reporter wallets sat idle at 0.1 ETH each, and the oracle hammered the RPC with `gas required exceeds allowance` forever. The fix:
+
+- **Pool + rotation**: the sender broadcasts from the whole reporter set (any funded EOA works — `msg.sender` isn't gated on-chain), round-robin, each wallet with its **own nonce counter** (advanced only on a successful broadcast; failures reuse the slot, never roll back).
+- **Failover before failure**: a drained wallet is skipped by a pre-flight balance gate (`maxFeePerGas × SUBMISSION_GAS_LIMIT_ESTIMATE`) or, if it fails the broadcast on `insufficient funds`, the send **fails over to the next wallet**. The funds-blocked event is raised **only after every wallet has been tried and refused**.
+- **Circuit breaker**: when the whole pool is drained the breaker trips open — broadcasting suspends, the heartbeat scheduler pauses, and a balance probe runs on exponential backoff (`SUBMISSION_BREAKER_BACKOFF_MIN_SEC` → `…_MAX_SEC`). Refunding any wallet auto-recovers. A funds shortage is **recoverable**, so the request stays queued within its TTL rather than being marked `failed`.
+- **Attribution**: each tx records its `broadcaster` wallet for replace-by-fee + ops visibility. Metrics: `oracle_circuit_breaker_open` (0/1), `oracle_broadcaster_funds_blocked_total`, and per-wallet `oracle_reporter_balance_eth` refreshed every 30s.
+
 ## Quickstart
 
 ```bash
@@ -98,6 +107,8 @@ Sensible defaults:
 | `SIGNER_THRESHOLD` / `SIGNER_ALLOW_INSECURE_PERMS` | `2` / `false` |
 | `SUBMISSION_MAX_RETRIES` / `REPLACE_AFTER_SEC` / `GAS_MULTIPLIER` / `CONFIRM_TIMEOUT_SEC` | `3` / `60` / `1.1` / `300` |
 | `SUBMISSION_WORKERS` / `SUBMISSION_REQUEST_TTL_SEC` | `4` / `600` (async pool size / pre-broadcast request TTL) |
+| `SUBMISSION_GAS_LIMIT_ESTIMATE` | `300000` (assumed fulfillPrice gas for the balance gate) |
+| `SUBMISSION_BREAKER_BACKOFF_MIN_SEC` / `…_MAX_SEC` | `60` / `900` (funds-breaker probe backoff bounds) |
 | `HEARTBEAT_ENABLED` / `INTERVAL_SEC` / `DEVIATION_THRESHOLD` | `true` / `3600` / `0.015` |
 | `CONVERSION_ON_CHAIN_DECIMALS` | `8` (Chainlink scale) |
 

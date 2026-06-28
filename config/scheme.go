@@ -101,6 +101,18 @@ type SubmissionConfig struct {
 	// marked `expired` and abandoned. TTL applies only PRE-broadcast — once a
 	// request consumes a nonce it runs to a terminal tx state. (task 06.1)
 	RequestTTLSec int `mapstructure:"request_ttl_sec"`
+
+	// GasLimitEstimate is the assumed fulfillPrice gas limit used ONLY by the
+	// pre-flight balance gate (SuggestGas leaves the real GasLimit at 0 and lets
+	// the node estimate, so there is no concrete limit at gate time). A
+	// conservative over-estimate (~2x the observed ~150k) doubles as the gate's
+	// safety margin. (task 06.2)
+	GasLimitEstimate uint64 `mapstructure:"gas_limit_estimate"`
+	// BreakerBackoffMinSec / BreakerBackoffMaxSec bound the exponential backoff
+	// the circuit breaker waits between balance probes while it is open (all
+	// broadcaster wallets drained). (task 06.2)
+	BreakerBackoffMinSec int `mapstructure:"breaker_backoff_min_sec"`
+	BreakerBackoffMaxSec int `mapstructure:"breaker_backoff_max_sec"`
 }
 
 // HeartbeatConfig holds per-asset heartbeat scheduler defaults.

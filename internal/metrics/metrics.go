@@ -30,6 +30,10 @@ type Metrics struct {
 	RequestsQueuedTotal       prometheus.Counter
 	RequestsExpiredTotal      *prometheus.CounterVec
 	RequestProcessingDuration prometheus.Histogram
+
+	// Funds-awareness + circuit breaker (task 06.2/06.3).
+	BroadcasterFundsBlockedTotal prometheus.Counter
+	CircuitBreakerOpen           prometheus.Gauge
 }
 
 // New constructs and registers every metric on a fresh registry.
@@ -89,6 +93,14 @@ func New() *Metrics {
 			Help:    "Seconds from claim to hand-off to the sender (price fetch + sign).",
 			Buckets: prometheus.DefBuckets,
 		}),
+		BroadcasterFundsBlockedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "oracle_broadcaster_funds_blocked_total",
+			Help: "Times a submission exhausted EVERY broadcaster wallet on funds (breaker tripped open).",
+		}),
+		CircuitBreakerOpen: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "oracle_circuit_breaker_open",
+			Help: "1 while broadcasting is suspended (all wallets drained), 0 otherwise.",
+		}),
 	}
 
 	reg.MustRegister(
@@ -104,6 +116,8 @@ func New() *Metrics {
 		m.RequestsQueuedTotal,
 		m.RequestsExpiredTotal,
 		m.RequestProcessingDuration,
+		m.BroadcasterFundsBlockedTotal,
+		m.CircuitBreakerOpen,
 	)
 	return m
 }

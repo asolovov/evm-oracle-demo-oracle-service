@@ -51,6 +51,55 @@ func IsRevertError(err error) bool {
 		strings.Contains(msg, "invalid opcode")
 }
 
+// IsInsufficientFundsError reports whether err means the broadcasting wallet
+// cannot pay for the transaction — a THIRD outcome class distinct from a
+// permanent revert (IsRevertError) and a generic transient error.
+//
+// Two go-ethereum code paths surface a drained wallet, and we match both:
+//
+//   - "insufficient funds …" — the node rejects the signed tx at broadcast
+//     time. Covers core ErrInsufficientFunds
+//     ("insufficient funds for gas * price + value", incl. the EIP-1559
+//     maxFeePerGas balance check) and "insufficient funds for transfer".
+//   - "gas required exceeds allowance" — surfaces at CLIENT-SIDE
+//     eth_estimateGas (we leave GasLimit unset, so bind estimates). The
+//     estimator caps its gas ceiling at balance/feeCap, which collapses to
+//     near-zero for a near-empty wallet, so estimation fails here long before
+//     the tx is signed.
+//
+// CAUTION: "gas required exceeds allowance" is NOT categorically a funds
+// problem — it is the generic estimator-ceiling error and a funded wallet can
+// hit it transiently. Callers MUST corroborate it with an explicit balance
+// check (see Submitter.canAfford) before treating it as drained; the string
+// alone must not trip the circuit breaker.
+//
+// We deliberately match the EXACT substrings below and never bare
+// "insufficient": the PriceAggregator contract defines InsufficientFee /
+// InsufficientSignatures custom errors whose revert strings would otherwise
+// be misclassified as funds problems.
+func IsInsufficientFundsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "insufficient funds") ||
+		strings.Contains(msg, "gas required exceeds allowance")
+}
+
+// IsGasAllowanceError reports whether err is specifically the client-side
+// estimator-ceiling error ("gas required exceeds allowance"). Unlike a node
+// "insufficient funds" rejection (authoritative — that wallet truly can't pay),
+// this string is AMBIGUOUS: it also fires for an ordinary out-of-gas on a
+// funded wallet. Callers should corroborate it with a balance check before
+// treating the wallet as drained; on its own it must not drive failover or trip
+// the breaker.
+func IsGasAllowanceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "gas required exceeds allowance")
+}
+
 // Client is a thin go-ethereum wrapper centered on the surface oracle-service
 // needs: fulfillPrice broadcasts, EIP-1559 gas pricing, latestRoundData reads.
 type Client struct {

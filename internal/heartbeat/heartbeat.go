@@ -76,6 +76,7 @@ type Scheduler struct {
 	done     chan struct{}
 
 	onSkipped func(symbol string)
+	paused    func() bool
 }
 
 // Option tunes the Scheduler at construction time.
@@ -89,6 +90,14 @@ func WithLogger(log *logrus.Entry) Option {
 // WithSkippedCounter wires the oracle_heartbeat_skipped_total metric.
 func WithSkippedCounter(cb func(symbol string)) Option {
 	return func(s *Scheduler) { s.onSkipped = cb }
+}
+
+// WithPauseCheck wires a predicate consulted at the top of every tick: when it
+// returns true the whole tick is skipped. Used to pause heartbeat firing while
+// the submitter's circuit breaker is open (all broadcaster wallets drained),
+// so we don't enqueue doomed work every tick (task 06.2).
+func WithPauseCheck(paused func() bool) Option {
+	return func(s *Scheduler) { s.paused = paused }
 }
 
 // New constructs a Scheduler. application.go wires Start/Stop.
@@ -174,6 +183,14 @@ func (s *Scheduler) run(parent context.Context) {
 // tick walks every managed symbol and dispatches the ones whose policy says
 // "fire now".
 func (s *Scheduler) tick(ctx context.Context) {
+	// Skip the whole tick while broadcasting is suspended (breaker open): every
+	// fire would just enqueue a request that can't be paid for. The submitter
+	// resumes us by closing the breaker once a wallet is refunded.
+	if s.paused != nil && s.paused() {
+		s.log.Debug("heartbeat tick skipped: broadcasting suspended (breaker open)")
+		return
+	}
+
 	// Reload the per-asset schedule from the repo so SetHeartbeat changes
 	// take effect on the next tick.
 	persisted, err := s.store.ListHeartbeats(ctx)

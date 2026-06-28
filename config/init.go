@@ -75,6 +75,9 @@ func setDefaults() {
 	viper.SetDefault("submission.confirm_timeout_sec", 300)
 	viper.SetDefault("submission.workers", 4)
 	viper.SetDefault("submission.request_ttl_sec", 600)
+	viper.SetDefault("submission.gas_limit_estimate", 300000)
+	viper.SetDefault("submission.breaker_backoff_min_sec", 60)
+	viper.SetDefault("submission.breaker_backoff_max_sec", 900)
 
 	// Heartbeat.
 	viper.SetDefault("heartbeat.enabled", true)
@@ -87,6 +90,37 @@ func setDefaults() {
 	// Telemetry.
 	viper.SetDefault("telemetry.log_level", "info")
 	viper.SetDefault("telemetry.log_format", "json")
+}
+
+// validate range-checks the submission keys. Split out of Scheme.Validate to
+// keep that function's cyclomatic complexity in check.
+func (c *SubmissionConfig) validate() []error {
+	var errs []error
+	if c.MaxRetries < 0 {
+		errs = append(errs, errors.New("submission.max_retries must be >= 0"))
+	}
+	if c.ReplaceAfterSec <= 0 {
+		errs = append(errs, errors.New("submission.replace_after_sec must be > 0"))
+	}
+	if c.GasMultiplier < 1.0 {
+		errs = append(errs, errors.New("submission.gas_multiplier must be >= 1.0"))
+	}
+	if c.Workers <= 0 {
+		errs = append(errs, errors.New("submission.workers must be > 0"))
+	}
+	if c.RequestTTLSec <= 0 {
+		errs = append(errs, errors.New("submission.request_ttl_sec must be > 0"))
+	}
+	if c.GasLimitEstimate == 0 {
+		errs = append(errs, errors.New("submission.gas_limit_estimate must be > 0"))
+	}
+	if c.BreakerBackoffMinSec <= 0 {
+		errs = append(errs, errors.New("submission.breaker_backoff_min_sec must be > 0"))
+	}
+	if c.BreakerBackoffMaxSec < c.BreakerBackoffMinSec {
+		errs = append(errs, errors.New("submission.breaker_backoff_max_sec must be >= submission.breaker_backoff_min_sec"))
+	}
+	return errs
 }
 
 // Validate fails fast on missing or out-of-range required keys.
@@ -135,21 +169,7 @@ func (s *Scheme) Validate() error {
 		errs = append(errs, errors.New("signer.reporter_addresses, when set, must match signer.reporter_key_paths length"))
 	}
 
-	if s.Submission.MaxRetries < 0 {
-		errs = append(errs, errors.New("submission.max_retries must be >= 0"))
-	}
-	if s.Submission.ReplaceAfterSec <= 0 {
-		errs = append(errs, errors.New("submission.replace_after_sec must be > 0"))
-	}
-	if s.Submission.GasMultiplier < 1.0 {
-		errs = append(errs, errors.New("submission.gas_multiplier must be >= 1.0"))
-	}
-	if s.Submission.Workers <= 0 {
-		errs = append(errs, errors.New("submission.workers must be > 0"))
-	}
-	if s.Submission.RequestTTLSec <= 0 {
-		errs = append(errs, errors.New("submission.request_ttl_sec must be > 0"))
-	}
+	errs = append(errs, s.Submission.validate()...)
 
 	if s.Conversion.OnChainDecimals <= 0 || s.Conversion.OnChainDecimals > 18 {
 		errs = append(errs, errors.New("conversion.on_chain_decimals must be in (0, 18]"))

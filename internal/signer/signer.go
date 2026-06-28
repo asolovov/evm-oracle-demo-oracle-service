@@ -114,8 +114,12 @@ func (s *Signer) Threshold() int { return s.threshold }
 // BroadcasterAddress is the EOA the chain client uses to broadcast
 // fulfillPrice transactions. The contracts do not check msg.sender (the
 // digest signature set is the sole authorisation), so we reuse the first
-// reporter key for broadcasting. This keeps the demo at three funded
-// wallets instead of four.
+// reporter key for broadcasting.
+//
+// Deprecated: the submitter now broadcasts from the whole Broadcasters() pool
+// with per-wallet nonce management and failover (so draining one wallet no
+// longer stalls the oracle). Retained only as the first-wallet shim for any
+// caller that still needs a single deterministic address.
 func (s *Signer) BroadcasterAddress() common.Address {
 	if len(s.reporters) == 0 {
 		return common.Address{}
@@ -123,20 +127,44 @@ func (s *Signer) BroadcasterAddress() common.Address {
 	return s.reporters[0].Address
 }
 
-// NewBroadcaster returns a *bind.TransactOpts configured for the first
-// reporter key. Callers are expected to set GasTipCap / GasFeeCap / Nonce
+// Broadcasters returns every EOA available to broadcast fulfillPrice txs.
+//
+// Because the on-chain contract does not gate msg.sender (the M-of-N digest
+// signatures are the sole authorisation), ANY funded EOA can broadcast — so
+// for the demo the broadcaster pool is simply the full reporter set. The
+// submitter rotates across these and fails over when one drains; only when
+// EVERY wallet is drained does it surface a funds failure.
+func (s *Signer) Broadcasters() []common.Address {
+	return s.Reporters()
+}
+
+// NewBroadcaster returns a *bind.TransactOpts for the first reporter key.
+//
+// Deprecated: use NewBroadcasterFor to build a transactor for a specific
+// pool wallet. Kept for back-compat; equivalent to
+// NewBroadcasterFor(BroadcasterAddress()).
+func (s *Signer) NewBroadcaster() (*bind.TransactOpts, error) {
+	return s.NewBroadcasterFor(s.BroadcasterAddress())
+}
+
+// NewBroadcasterFor returns a *bind.TransactOpts configured for the reporter
+// EOA at addr. Callers are expected to set GasTipCap / GasFeeCap / Nonce
 // before broadcasting; this helper only seals the from-address + signer.
 //
-// (Imported above lazily because TransactOpts lives in accounts/abi/bind.)
-func (s *Signer) NewBroadcaster() (*bind.TransactOpts, error) {
-	if len(s.reporters) == 0 {
-		return nil, errors.New("no reporter keys loaded; cannot build broadcaster")
+// Returns an error if addr is not one of the loaded reporter keys — the
+// private key never leaves this package, so the transactor can only be built
+// here.
+func (s *Signer) NewBroadcasterFor(addr common.Address) (*bind.TransactOpts, error) {
+	for i := range s.reporters {
+		if s.reporters[i].Address == addr {
+			opts, err := bind.NewKeyedTransactorWithChainID(s.reporters[i].privateKey, s.chainID)
+			if err != nil {
+				return nil, fmt.Errorf("build keyed transactor for %s: %w", addr.Hex(), err)
+			}
+			return opts, nil
+		}
 	}
-	opts, err := bind.NewKeyedTransactorWithChainID(s.reporters[0].privateKey, s.chainID)
-	if err != nil {
-		return nil, fmt.Errorf("build keyed transactor: %w", err)
-	}
-	return opts, nil
+	return nil, fmt.Errorf("no reporter key loaded for broadcaster %s", addr.Hex())
 }
 
 // BuildDigest mirrors PriceLib.buildDigest. Exposed so the submitter can sign

@@ -73,6 +73,11 @@ type App struct {
 	grpcDone    chan error
 	healthzDone chan error
 	stoppedOnce sync.Once
+
+	// Continuous reporter-balance gauge refresher (task 06.2).
+	balanceStop    chan struct{}
+	balanceDone    chan struct{}
+	balanceStarted bool
 }
 
 // NewApplication creates an App with a zero config (filled by cmd/root via viper).
@@ -89,6 +94,8 @@ func NewApplication() (*App, error) {
 		log:         logger.Log().WithField("component", "application"),
 		grpcDone:    make(chan error, 1),
 		healthzDone: make(chan error, 1),
+		balanceStop: make(chan struct{}),
+		balanceDone: make(chan struct{}),
 	}, nil
 }
 
@@ -171,6 +178,16 @@ func (app *App) Init() error {
 			func(asset string) { app.metrics.RequestsExpiredTotal.WithLabelValues(asset).Inc() },
 			func(sec float64) { app.metrics.RequestProcessingDuration.Observe(sec) },
 		),
+		submitter.WithFundsMetrics(
+			func() { app.metrics.BroadcasterFundsBlockedTotal.Inc() },
+			func(open bool) {
+				if open {
+					app.metrics.CircuitBreakerOpen.Set(1)
+				} else {
+					app.metrics.CircuitBreakerOpen.Set(0)
+				}
+			},
+		),
 	)
 	app.submitter = sub
 
@@ -194,6 +211,9 @@ func (app *App) Init() error {
 		heartbeat.WithSkippedCounter(func(sym string) {
 			app.metrics.HeartbeatSkippedTotal.WithLabelValues(sym).Inc()
 		}),
+		// Pause heartbeat fires while broadcasting is suspended (breaker open):
+		// every fire would just enqueue an unpayable request (task 06.2).
+		heartbeat.WithPauseCheck(sub.BroadcastSuspended),
 	)
 	app.heartbeatSched = hb
 
@@ -209,21 +229,55 @@ func (app *App) Init() error {
 		app.log.WithField("component", "healthz"),
 	)
 
-	// Reporter address gauge (best-effort balance read at startup).
-	weiPerEth := new(big.Float).SetPrec(256).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
-	for _, addr := range sgn.Reporters() {
-		bal, err := cc.BalanceAt(ctx, addr)
-		if err == nil && bal != nil {
-			// Express in ETH for human-readable scraping. 1e18 wei == 1 ETH.
-			eth := new(big.Float).SetInt(bal)
-			eth.Quo(eth, weiPerEth)
-			fl, _ := eth.Float64()
-			app.metrics.ReporterBalance.WithLabelValues(addr.Hex()).Set(fl)
-		}
-	}
+	// Reporter/broadcaster balance gauge — seed it once now; Serve starts a
+	// ticker that keeps it fresh (so a low-balance alert can fire BEFORE a
+	// wallet fully drains, not just at startup — task 06.2).
+	app.refreshBalances(ctx)
 
 	app.log.Info("application initialized")
 	return nil
+}
+
+// balanceRefreshInterval is how often the reporter-balance gauge is refreshed.
+const balanceRefreshInterval = 30 * time.Second
+
+// refreshBalances reads each broadcaster wallet's native balance and publishes
+// it (in ETH) to the oracle_reporter_balance_eth gauge. Best-effort: a failed
+// read for one wallet is skipped, leaving its last value.
+func (app *App) refreshBalances(ctx context.Context) {
+	if app.chainClient == nil || app.signer == nil {
+		return
+	}
+	weiPerEth := new(big.Float).SetPrec(256).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+	for _, addr := range app.signer.Broadcasters() {
+		bal, err := app.chainClient.BalanceAt(ctx, addr)
+		if err != nil || bal == nil {
+			continue
+		}
+		// Express in ETH for human-readable scraping. 1e18 wei == 1 ETH.
+		eth := new(big.Float).SetInt(bal)
+		eth.Quo(eth, weiPerEth)
+		fl, _ := eth.Float64()
+		app.metrics.ReporterBalance.WithLabelValues(addr.Hex()).Set(fl)
+	}
+}
+
+// runBalanceRefresher keeps the reporter-balance gauge current on a ticker
+// until Stop signals balanceStop.
+func (app *App) runBalanceRefresher() {
+	defer close(app.balanceDone)
+	ticker := time.NewTicker(balanceRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-app.balanceStop:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			app.refreshBalances(ctx)
+			cancel()
+		}
+	}
 }
 
 // Serve starts every long-running component and blocks until a shutdown
@@ -247,6 +301,10 @@ func (app *App) Serve() error {
 	// Start stream consumer + heartbeat.
 	app.streamConsumer.Start(ctx)
 	app.heartbeatSched.Start(ctx)
+
+	// Keep the reporter-balance gauge fresh.
+	app.balanceStarted = true
+	go app.runBalanceRefresher()
 
 	app.log.Info("application running; press Ctrl+C to stop")
 
@@ -275,6 +333,9 @@ func (app *App) Stop() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
+		// Stop the balance refresher first (cheap, no downstream deps).
+		app.stopBalanceRefresher()
+
 		// Drain order: stop intake (heartbeat + stream) → drain the submitter
 		// pipeline (workers + sender + watchers) → transports → clients.
 		stopErr = errors.Join(
@@ -290,6 +351,14 @@ func (app *App) Stop() error {
 		)
 	})
 	return stopErr
+}
+
+func (app *App) stopBalanceRefresher() {
+	if !app.balanceStarted {
+		return
+	}
+	close(app.balanceStop)
+	<-app.balanceDone
 }
 
 func (app *App) stopHeartbeat(ctx context.Context) error {
